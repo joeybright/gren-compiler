@@ -190,8 +190,21 @@ kernelCodePublicKey =
 
 kernelCodeSignedByLeadDeveloper :: FilePath -> IO Bool
 kernelCodeSignedByLeadDeveloper path = do
-  -- Always return true to get kernal code running for this install of the compiler
-  return True
+  maybeExec <- checkInstalledGit
+  case maybeExec of
+    Nothing ->
+      return False
+    Just git -> do
+      jsFilesUnchanged <- noChangesToJSFilesSinceHead git path
+      if not jsFilesUnchanged
+        then return False
+        else do
+          commitHash <- lastCommitWithChangesToJSFile git path
+          if commitHash == ""
+            then return True -- no JS files
+            else do
+              publicKey <- extractPublicKeyFromCommit git path commitHash
+              return $ publicKey == kernelCodePublicKey
 
 noChangesToJSFilesSinceHead :: FilePath -> FilePath -> IO Bool
 noChangesToJSFilesSinceHead git path = do
