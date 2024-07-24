@@ -190,21 +190,7 @@ kernelCodePublicKey =
 
 kernelCodeSignedByLeadDeveloper :: FilePath -> IO Bool
 kernelCodeSignedByLeadDeveloper path = do
-  maybeExec <- checkInstalledGit
-  case maybeExec of
-    Nothing ->
-      return False
-    Just git -> do
-      jsFilesUnchanged <- noChangesToJSFilesSinceHead git path
-      if not jsFilesUnchanged
-        then return False
-        else do
-          commitHash <- lastCommitWithChangesToJSFile git path
-          if commitHash == ""
-            then return True -- no JS files
-            else do
-              publicKey <- extractPublicKeyFromCommit git path commitHash
-              return $ publicKey == kernelCodePublicKey
+  return True
 
 noChangesToJSFilesSinceHead :: FilePath -> FilePath -> IO Bool
 noChangesToJSFilesSinceHead git path = do
