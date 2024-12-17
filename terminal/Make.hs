@@ -3,10 +3,7 @@
 module Make
   ( Flags (..),
     Output (..),
-    ReportType (..),
     run,
-    reportType,
-    output,
     rereadSources,
   )
 where
@@ -37,16 +34,14 @@ import Reporting.Task qualified as Task
 import System.Directory qualified as Dir
 import System.FilePath qualified as FP
 import System.IO qualified as IO
-import Terminal (Parser (..))
 
 -- FLAGS
 
 data Flags = Flags
-  { _debug :: Bool,
-    _optimize :: Bool,
+  { _optimize :: Bool,
     _sourceMaps :: Bool,
     _output :: Maybe Output,
-    _report :: Maybe ReportType
+    _report :: Bool
   }
 
 data Output
@@ -55,16 +50,14 @@ data Output
   | Html FilePath
   | DevNull
   | DevStdOut
-
-data ReportType
-  = Json
+  deriving (Show)
 
 -- RUN
 
 type Task a = Task.Task Exit.Make a
 
 run :: [FilePath] -> Flags -> IO ()
-run paths flags@(Flags _ _ _ maybeOutput report) =
+run paths flags@(Flags _ _ maybeOutput report) =
   do
     style <- getStyle maybeOutput report
     maybeRoot <- Dirs.findRoot
@@ -74,12 +67,12 @@ run paths flags@(Flags _ _ _ maybeOutput report) =
         Nothing -> return $ Left Exit.MakeNoOutline
 
 runHelp :: FilePath -> [FilePath] -> Reporting.Style -> Flags -> IO (Either Exit.Make ())
-runHelp root paths style (Flags debug optimize withSourceMaps maybeOutput _) =
+runHelp root paths style (Flags optimize withSourceMaps maybeOutput _) =
   BW.withScope $ \scope ->
     Dirs.withRootLock root $
       Task.run $
         do
-          desiredMode <- getMode debug optimize
+          desiredMode <- getMode optimize
           details <- Task.eio Exit.MakeBadDetails (Details.load style scope root)
           let platform = getPlatform details
           let projectType = getProjectType details
@@ -160,20 +153,18 @@ runHelp root paths style (Flags debug optimize withSourceMaps maybeOutput _) =
 
 -- GET INFORMATION
 
-getStyle :: Maybe Output -> Maybe ReportType -> IO Reporting.Style
+getStyle :: Maybe Output -> Bool -> IO Reporting.Style
 getStyle maybeOutput report =
   case (maybeOutput, report) of
     (Just DevStdOut, _) -> return Reporting.silent
-    (_, Nothing) -> Reporting.terminal
-    (_, Just Json) -> return Reporting.json
+    (_, False) -> Reporting.terminal
+    (_, True) -> return Reporting.json
 
-getMode :: Bool -> Bool -> Task DesiredMode
-getMode debug optimize =
-  case (debug, optimize) of
-    (True, True) -> Task.throw Exit.MakeCannotOptimizeAndDebug
-    (True, False) -> return Debug
-    (False, False) -> return Dev
-    (False, True) -> return Prod
+getMode :: Bool -> Task DesiredMode
+getMode optimize =
+  case optimize of
+    False -> return Dev
+    True -> return Prod
 
 rereadSources :: FilePath -> IO (Map ModuleName.Canonical String)
 rereadSources root =
@@ -291,55 +282,11 @@ writeToDisk style target builder names =
 
 -- GENERATE
 
-data DesiredMode = Debug | Dev | Prod
+data DesiredMode = Dev | Prod
 
 generate :: FilePath -> Details.Details -> DesiredMode -> Build.Artifacts -> Task JS.GeneratedResult
 generate root details desiredMode artifacts =
   Task.mapError Exit.MakeBadGenerate $
     case desiredMode of
-      Debug -> Generate.debug root details artifacts
       Dev -> Generate.dev root details artifacts
       Prod -> Generate.prod root details artifacts
-
--- PARSERS
-
-reportType :: Parser ReportType
-reportType =
-  Parser
-    { _singular = "report type",
-      _plural = "report types",
-      _parser = \string -> if string == "json" then Just Json else Nothing,
-      _suggest = \_ -> return ["json"],
-      _examples = \_ -> return ["json"]
-    }
-
-output :: Parser Output
-output =
-  Parser
-    { _singular = "output file",
-      _plural = "output files",
-      _parser = parseOutput,
-      _suggest = \_ -> return [],
-      _examples = \_ -> return ["gren.js", "index.html", "/dev/null", "/dev/stdout"]
-    }
-
-parseOutput :: String -> Maybe Output
-parseOutput name
-  | name == "/dev/stdout" = Just DevStdOut
-  | isDevNull name = Just DevNull
-  | hasExt ".html" name = Just (Html name)
-  | hasExt ".js" name = Just (JS name)
-  | noExt name = Just (Exe name)
-  | otherwise = Nothing
-
-hasExt :: String -> String -> Bool
-hasExt ext path =
-  FP.takeExtension path == ext && length path > length ext
-
-noExt :: String -> Bool
-noExt path =
-  FP.takeExtension path == ""
-
-isDevNull :: String -> Bool
-isDevNull name =
-  name == "/dev/null" || name == "NUL" || name == "$null"

@@ -4,7 +4,6 @@ The built-in comparison operators work on a fixed set of types, like `Int` and `
 
 This page aims to catalog these scenarios and offer alternative paths that can get you unstuck.
 
-
 ## Wrapped Types
 
 It is common to try to get some extra type safety by creating really simple custom types:
@@ -62,7 +61,6 @@ There are a couple nice things about this approach:
 
 So while this approach is not as convenient as using a `Dict` directly, it has some benefits of its own that can be helpful in some cases.
 
-
 ## Enumerations to Ints
 
 Say you need to define a `trafficLightToInt` function:
@@ -77,21 +75,20 @@ trafficLightToInt trafficLight =
 
 We have heard that some people would prefer to use a dictionary for this sort of thing. That way you do not need to write the numbers yourself, they can be generated such that you never have a typo.
 
-I would recommend using a `case` expression though:
+I would recommend using a `when` expression though:
 
 ```gren
 type TrafficLight = Green | Yellow | Red
 
 trafficLightToInt : TrafficLight -> Int
 trafficLightToInt trafficLight =
-  case trafficLight of
+  when trafficLight is
     Green  -> 1
     Yellow -> 2
     Red    -> 3
 ```
 
 This is really straight-forward while avoiding questions like “is `Green` less than or greater than `Red`?”
-
 
 ## Something else?
 

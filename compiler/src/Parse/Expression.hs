@@ -286,12 +286,12 @@ chompExprEnd start (State ops expr args end commentsBefore) =
         newStart <- getPosition
         if "-" == opName && end /= opStart && opEnd == newStart
           then -- negative terms
-            do
-              negatedExpr <- term
-              newEnd <- getPosition
-              commentsAfter <- Space.chomp E.Space
-              let arg = A.at opStart newEnd (Src.Negate negatedExpr)
-              chompExprEnd start (State ops expr ((commentsBefore, arg) : args) newEnd commentsAfter)
+          do
+            negatedExpr <- term
+            newEnd <- getPosition
+            commentsAfter <- Space.chomp E.Space
+            let arg = A.at opStart newEnd (Src.Negate negatedExpr)
+            chompExprEnd start (State ops expr ((commentsBefore, arg) : args) newEnd commentsAfter)
           else
             let err = E.OperatorRight opName
                 opComments = SC.BinopsSegmentComments commentsBefore commentsAfterOp
@@ -419,12 +419,12 @@ chompArgs revArgs commentsBefore =
 
 case_ :: A.Position -> Space.Parser E.Expr (Src.Expr, [Src.Comment])
 case_ start =
-  inContext E.Case (Keyword.case_ E.Start) $
+  inContext E.Case (Keyword.when_ E.Start) $
     do
       commentsBeforeExpr <- Space.chompAndCheckIndent E.CaseSpace E.CaseIndentExpr
       ((expr, commentsAfterExpr), exprEnd) <- specialize E.CaseExpr expression
       Space.checkIndent exprEnd E.CaseIndentOf
-      Keyword.of_ E.CaseOf
+      Keyword.is_ E.CaseOf
       commentsAfterOf <- Space.chompAndCheckIndent E.CaseSpace E.CaseIndentPattern
       withIndent $
         do

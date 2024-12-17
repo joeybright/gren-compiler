@@ -1,28 +1,30 @@
 {
   "name": "gren-lang",
-  "version": "0.4.4",
+  "version": "0.5.1",
   "description": "Compiler for the Gren programming language",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prepublishOnly": "npm run build",
+    "build": "npx --package=gren-lang@0.4.5 -- gren make src/Main.gren --output=compiler.js",
+    "prettier": "prettier -w \"!**/*.json\" .",
+    "prettier:check": "prettier -c \"!**/*.json\" ."
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/gren-lang/compiler.git"
   },
   "files": [
-    "index.js"
+    "index.js",
+    "compiler.js",
+    "cli.js"
   ],
   "bin": {
-    "gren": "index.js"
+    "gren": "cli.js"
   },
   "keywords": [
     "gren",
     "lang",
-    "language",
-    "bin",
-    "binary",
-    "install",
-    "installer"
+    "language"
   ],
   "author": "Robin Heggelund Hansen",
   "license": "BSD-3-Clause",
@@ -31,5 +33,10 @@
   },
   "homepage": "https://gren-lang.org",
   "dependencies": {
+    "postject": "^1.0.0-alpha.6"
+  },
+  "devDependencies": {
+    "prettier": "3.3.3",
+    "gren-lang": "0.4.5"
   }
 }
