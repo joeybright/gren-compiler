@@ -1,5 +1,3 @@
-{-# OPTIONS_GHC -Wall #-}
-
 module Directories
   ( details,
     interfaces,
@@ -7,8 +5,6 @@ module Directories
     greni,
     greno,
     findRoot,
-    withRootLock,
-    withRegistryLock,
     PackageCache,
     getPackageCache,
     package,
@@ -22,7 +18,6 @@ import Gren.Package qualified as Pkg
 import Gren.Version qualified as V
 import System.Directory qualified as Dir
 import System.Environment qualified as Env
-import System.FileLock qualified as Lock
 import System.FilePath ((<.>), (</>))
 import System.FilePath qualified as FP
 
@@ -81,19 +76,6 @@ findRootHelp dirs =
         if exists
           then return (Just (FP.joinPath dirs))
           else findRootHelp (init dirs)
-
--- LOCKS
-
-withRootLock :: FilePath -> IO a -> IO a
-withRootLock root work =
-  do
-    let dir = projectCache root
-    Dir.createDirectoryIfMissing True dir
-    Lock.withFileLock (dir </> "lock") Lock.Exclusive (\_ -> work)
-
-withRegistryLock :: PackageCache -> IO a -> IO a
-withRegistryLock (PackageCache dir) work =
-  Lock.withFileLock (dir </> "lock") Lock.Exclusive (\_ -> work)
 
 -- PACKAGE CACHES
 

@@ -1,0 +1,97 @@
+module Terminal.Help exposing
+    ( confirm
+    , prettyPrint
+    , makeLink
+    , getNullStream
+    )
+
+import Cli.PrettyPrinter as PP
+import Bytes exposing (Bytes)
+import Stream
+import Stream.Log
+import Task exposing (Task)
+import FileSystem.Path as Path exposing (Path)
+import Meta
+import SemanticVersion
+
+
+type alias ConfirmConfig =
+    { stdout : Stream.Writable Bytes
+    , stdin : Stream.Readable Bytes
+    , useColor : Bool
+    , interactive : Bool
+    , question : PP.Document
+    , defaultValue : Bool
+    }
+
+
+confirm : ConfirmConfig -> Task Stream.Error Bool
+confirm { stdout, stdin, useColor, interactive, question, defaultValue } =
+    if not interactive then
+        Task.succeed defaultValue
+
+    else
+        let
+            legend =
+                if defaultValue then
+                    " [Y|n]: "
+
+                else
+                    " [y|N]: "
+        in
+        PP.block [ question, PP.text legend ]
+            |> prettyPrint { useColor = useColor }
+            |> Stream.Log.string stdout
+            |> Task.andThen (\_ -> Stream.readBytesAsString stdin)
+            |> Task.map
+                (\answer ->
+                    when String.trim <| String.toLower answer is
+                        "y" ->
+                            True
+
+                        "" ->
+                            defaultValue
+
+                        _ ->
+                            False
+                )
+
+
+prettyPrint : { useColor : Bool } -> PP.Document -> String
+prettyPrint { useColor } doc =
+    PP.toStringWithOptions
+        { maxColumns = 80
+        , indentationSize = 4
+        , newlineSeparator = "\n"
+        }
+        (if useColor then
+            doc
+
+        else
+            PP.stripColor doc
+        )
+
+
+makeLink : String -> PP.Document
+makeLink filename =
+    PP.block
+        [ PP.text "<"
+        , makeNakedLink filename
+        , PP.text ">"
+        ]
+
+
+makeNakedLink : String -> PP.Document
+makeNakedLink filename =
+    PP.block
+        [ PP.text "https://github.com/gren-lang/compiler/blob/"
+        , PP.text (SemanticVersion.toString Meta.version)
+        , PP.text ("/hints/" ++ filename ++ ".md")
+        ]
+
+
+getNullStream : Task x (Stream.Transformation Bytes Bytes)
+getNullStream =
+    Stream.customTransformation
+        (\state _ -> Stream.UpdateState state)
+        Bytes.empty

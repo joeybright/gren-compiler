@@ -1,5 +1,6 @@
 .DS_Store
 *~
+.envrc
 
 # Haskell build stuff
 dist
@@ -13,4 +14,4 @@ node_modules
 
 # Gren build stuff
 .gren
-compiler.js
+app

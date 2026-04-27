@@ -1,0 +1,328 @@
+module Terminal.Init exposing
+    ( Config
+    , Error (..)
+    , run
+    , runNonInteractive
+    , prettifyError
+    )
+
+import Cli.PrettyPrinter as PP
+import ChildProcess
+import Stream
+import Stream.Log
+import Task exposing (Task)
+import FileSystem
+import FileSystem.Path as Path exposing (Path)
+import Bytes exposing (Bytes)
+import Json.Encode as Json
+import Compiler.Backend
+import Compiler.Platform as Platform exposing (Platform)
+import Compiler.PackageName as PackageName exposing (PackageName)
+import Compiler.Outline as Outline exposing (Outline)
+import Compiler.License as License
+import Compiler.Paths
+import Terminal.Help
+import Git
+import SemanticVersion exposing (SemanticVersion)
+import SemanticVersionRange
+import Dict
+import Meta
+import Terminal.PackageInstall as PackageInstall
+import Terminal.Report as Report exposing (Report)
+
+
+type alias Config =
+    { stdout : Stream.Writable Bytes
+    , stdin : Stream.Readable Bytes
+    , fsPermission : FileSystem.Permission
+    , cpPermission : ChildProcess.Permission
+    , cacheRoot : Compiler.Paths.CacheRoot
+    , interactive : Bool
+    , useColor : Bool
+    , package : Bool
+    , platform : Platform
+    }
+
+
+type Error
+    = AlreadyInitialized
+    | FileSystemFailure FileSystem.Error
+    | PromptError Stream.Error
+    | CouldNotRetrieveVersions { packageName : PackageName, error : Git.Error }
+    | NoVersionFound PackageName
+    | InstallError PackageInstall.PackageInstallError
+
+
+run : Config -> Task Error {}
+run config =
+    let
+        grenJsonExists =
+            FileSystem.checkAccess config.fsPermission [] (Path.fromPosixString "gren.json")
+                |> Task.andThen
+                    (\_ ->
+                        Task.succeed True
+                    )
+                |> Task.onError
+                    (\err ->
+                        if FileSystem.errorIsNoSuchFileOrDirectory err then
+                            Task.succeed False
+
+                        else
+                            Task.fail (FileSystemFailure err)
+                    )
+    
+    in
+    grenJsonExists
+        |> Task.andThen
+            (\exists ->
+                if exists then
+                    Task.fail AlreadyInitialized
+
+                else
+                    Terminal.Help.confirm
+                        { stdout = config.stdout
+                        , stdin = config.stdin
+                        , useColor = config.useColor
+                        , interactive = config.interactive
+                        , question =
+                            PP.verticalBlock
+                                [ PP.block
+                                    [ PP.words "Hello! Gren projects always start with a"
+                                    , PP.text " "
+                                    , PP.color PP.Green (PP.text "gren.json")
+                                    , PP.text " "
+                                    , PP.words "file."
+                                    ]
+                                , PP.words "I can create one for you."
+                                , PP.empty
+                                , PP.words "Would you like me to create a gren.json file now?"
+                                ]
+                        , defaultValue = True
+                        }
+                        |> Task.mapError PromptError
+            )
+        |> Task.andThen
+            (\confirmed ->
+                if confirmed then
+                    runNonInteractive config Path.empty
+                        |> Task.map (\_ -> {})
+
+                else
+                    Stream.Log.line config.stdout "Ok, I won't do anything."
+            )
+
+
+runNonInteractive : Config -> Path -> Task Error Outline
+runNonInteractive config projectPath =
+    let
+        deps =
+            dependenciesForPlatform config.platform
+    in
+    deps
+        |> Array.map
+            (\packageName ->
+                Git.fetchLatestVersion config.cpPermission packageName
+                    |> Task.mapError
+                        (\err ->
+                            CouldNotRetrieveVersions { packageName = packageName, error = err }
+                        )
+                    |> Task.map
+                        (\vsn ->
+                            { name = packageName
+                            , version = vsn
+                            }
+                        )
+            )
+        |> Task.concurrent
+        |> Task.andThen (generateGrenJson config projectPath)
+
+
+dependenciesForPlatform : Platform -> Array PackageName
+dependenciesForPlatform platform =
+  when platform is
+    Platform.Common ->
+        [ PackageName.core ]
+
+    Platform.Browser ->
+        [ PackageName.core, PackageName.browser ]
+
+    Platform.Node ->
+        [ PackageName.core, PackageName.node ]
+
+
+generateGrenJson : Config -> Path -> Array { name : PackageName, version : SemanticVersion } -> Task Error Outline
+generateGrenJson config projectPath deps =
+    let
+        outline =
+            if config.package then
+                Outline.Pkg
+                    { platform = config.platform
+                    , name = PackageName.example
+                    , summary = ""
+                    , license = License.bsd3
+                    , version = { major = 1, minor = 0, patch = 0 }
+                    , exposedModules = Outline.ExposedArray []
+                    , grenVersion = SemanticVersionRange.compatibleWith Meta.version
+                    , dependencies =
+                        Array.foldl
+                            (\{ name, version } dict ->
+                                Dict.set
+                                    (PackageName.toString name)
+                                    (Outline.Version (SemanticVersionRange.compatibleWith version))
+                                    dict
+                            )
+                            Dict.empty
+                            deps
+                    }
+
+            else
+                Outline.App
+                    { platform = config.platform
+                    , sourceDirectories = [ Path.fromPosixString "src" ]
+                    , grenVersion = Meta.version
+                    , dependencies =
+                        { direct =
+                            Array.foldl
+                                (\{ name, version } dict ->
+                                    Dict.set (PackageName.toString name) (Outline.Version version) dict
+                                )
+                                Dict.empty
+                                deps
+                        , indirect = Dict.empty
+                        }
+                    }
+    in
+    PackageInstall.run
+        { stdout = config.stdout
+        , stdin = config.stdin
+        , fsPermission = config.fsPermission
+        , cpPermission = config.cpPermission
+        , cacheRoot = config.cacheRoot
+        , interactive = config.interactive
+        , useColor = config.useColor
+        , strictAppResolution = False
+        }
+        { projectPath = projectPath
+        , outline = outline
+        }
+        |> Task.mapError InstallError
+        |> Task.andThen
+            (\resolution ->
+                let
+                    newOutline =
+                        when outline is
+                            Outline.App appOutline ->
+                                let
+                                    originalDependencyNames =
+                                        Dict.keys appOutline.dependencies.direct
+
+                                    indirectDeps =
+                                        resolution.dependencies
+                                            |> Dict.keepIf (\name _ -> not <| Array.member name originalDependencyNames)
+                                            |> Dict.map (\_ package -> Outline.Version package.outline.version)
+                                in
+                                Outline.App
+                                    { appOutline
+                                        | dependencies =
+                                            { appOutline.dependencies
+                                                | indirect = indirectDeps
+                                            }
+                                    }
+
+                            Outline.Pkg _ ->
+                                outline
+
+                    encodedOutline =
+                        newOutline
+                            |> Outline.toJson
+                            |> Json.encode 4
+                in
+                Path.append (Path.fromPosixString "gren.json") projectPath
+                    |> FileSystem.writeFile config.fsPermission (Bytes.fromString encodedOutline)
+                    |> Task.andThen
+                        (\_ ->
+                            Path.append (Path.fromPosixString "src") projectPath
+                                |> FileSystem.makeDirectory config.fsPermission { recursive = False }
+                        )
+                    |> Task.mapError FileSystemFailure
+                    |> Task.map (\_ -> newOutline)
+            )
+
+
+prettifyError : Error -> Report
+prettifyError err =
+    when err is
+        AlreadyInitialized ->
+            Report.create
+                "EXISTING PROJECT"
+                Nothing
+                (PP.verticalBlock
+                    [ PP.words "You already have a gren.json file, so there's nothing for me to initialize!"
+                    , PP.empty
+                    , PP.block
+                        [ PP.text "Maybe "
+                        , PP.color PP.Green (Terminal.Help.makeLink "init")
+                        , PP.text " "
+                        , PP.words "can help you figure out what to do next?"
+                        ]
+                    ]
+                )
+
+        FileSystemFailure fsErr ->
+            Report.create
+                "FILESYSTEM ERROR"
+                (Just <| FileSystem.errorPath fsErr)
+                (PP.verticalBlock
+                    [ PP.words "An unexpected error occured when accessing the filesystem."
+                    , PP.empty
+                    , PP.words "The error provided by the operating system is:"
+                    , PP.empty
+                    , PP.words (FileSystem.errorToString fsErr)
+                        |> PP.color PP.Red
+                        |> PP.indent
+                    , PP.empty
+                    , PP.words "Verify that you have access to this path. If the error persist, consider submitting a bug report."
+                    ]
+                )
+
+        PromptError streamError ->
+            Report.create
+                "STREAM ERROR"
+                Nothing
+                (PP.verticalBlock
+                    [ PP.words "An unexpected error occured with either the standard output or standard input streams."
+                    , PP.empty
+                    , PP.words "The error is:"
+                    , PP.empty
+                    , PP.words (Stream.errorToString streamError)
+                        |> PP.color PP.Red
+                        |> PP.indent
+                    , PP.empty
+                    , PP.words "This is most likely a bug. Consider submitting a bug report."
+                    ]
+                )
+
+        CouldNotRetrieveVersions { packageName, error } ->
+            Git.report
+                "FAILED TO LOAD DEPENDENCIES"
+                ("I tried to find the latest compatible versions of the " ++ PackageName.toString packageName)
+                error
+
+        NoVersionFound packageName ->
+            Report.create
+                "FAILED TO LOAD DEPENDENCIES"
+                Nothing
+                (PP.verticalBlock
+                    [ PP.words "I tried to find the latest compatible versions of the"
+                    , PP.text " "
+                    , PP.text (PackageName.toString packageName)
+                        |> PP.color PP.Green
+                    , PP.text " "
+                    , PP.words "but failed to find any versions for that package!"
+                    , PP.empty
+                    , PP.words "This is most likely a bug. Consider submitting a bug report."
+                    ]
+                )
+
+        InstallError installError ->
+            PackageInstall.prettifyError installError

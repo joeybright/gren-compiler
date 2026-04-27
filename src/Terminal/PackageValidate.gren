@@ -1,0 +1,449 @@
+module Terminal.PackageValidate exposing
+    ( Config
+    , Options
+    , Error (..)
+    , Result
+    , run
+    , prettifyError
+    )
+
+
+import Bytes
+import ChildProcess
+import Compiler.Backend
+import Compiler.PackageName as PackageName exposing (PackageName)
+import Compiler.Paths
+import Compiler.Outline as Outline exposing (Outline)
+import Compiler.Dependencies
+import Git
+import Stream
+import Stream.Log
+import Task exposing (Task)
+import Dict exposing (Dict)
+import FileSystem
+import FileSystem.Path as Path exposing (Path)
+import Bytes exposing (Bytes)
+import SemanticVersion exposing (SemanticVersion)
+import SemanticVersionRange exposing (SemanticVersionRange)
+import Json.Encode as Json
+import Json.Decode as Decode exposing (Decoder)
+import Terminal.PackageInstall
+import Terminal.Help as Help
+import Cli.PrettyPrinter as PP
+import Terminal.Report as Report exposing (Report)
+
+
+type alias Config =
+    { fsPermission : FileSystem.Permission
+    , cpPermission : ChildProcess.Permission
+    , cacheRoot : Compiler.Paths.CacheRoot
+    , interactive : Bool
+    , useColor : Bool
+    , stdout : Stream.Writable Bytes
+    , stdin : Stream.Readable Bytes
+    }
+
+
+type alias Options =
+    { projectPath : Path
+    , outline : Outline
+    }
+
+
+type Error
+    = IsApplication
+    | NoExposedModules
+    | BadSummary
+    | HasLocalDependencies
+    | FailedToFetchVersions Git.Error
+    | FailedToReadReadme FileSystem.Error
+    | ShortReadme
+    | FailedToReadLicense FileSystem.Error
+    | NoPublishedVersionAndNot1
+    | NoLocalTag
+    | HasLocalChanges
+    | PackageInstallError Terminal.PackageInstall.PackageInstallError
+    | PreviousPackageCorrupted
+
+
+type alias Result =
+    { projectPath : Path
+    , knownVersions : Array SemanticVersion
+    , previousVersion :
+        Maybe
+            { outline : Outline
+            , rootSources : Dict String Compiler.Backend.SourceFile
+            , dependencies : Dict String { path : Path, outline : Outline.PkgOutline, sources : Dict String String }
+            }
+    , currentVersion :
+        { outline : Outline
+        , rootSources : Dict String Compiler.Backend.SourceFile
+        , dependencies : Dict String { path : Path, outline : Outline.PkgOutline, sources : Dict String String }
+        }
+    }
+
+
+run : Config -> Options -> Task Error Result
+run config { projectPath, outline } =
+    when outline is
+        Outline.App _ ->
+            Task.fail IsApplication
+
+        Outline.Pkg pkgOutline ->
+            if noExposed pkgOutline.exposedModules then
+                Task.fail NoExposedModules
+
+            else if badSummary pkgOutline.summary then
+                Task.fail BadSummary
+
+            else if hasLocalDeps pkgOutline.dependencies then
+                Task.fail HasLocalDependencies
+
+            else
+                Task.await (Task.mapError FailedToFetchVersions <| Git.fetchVersions config.cpPermission pkgOutline.name) <| \knownVersions ->
+                Task.await (verifyVersion pkgOutline.version knownVersions) <| \{} ->
+                Task.await (verifyReadme config.fsPermission projectPath) <| \{} ->
+                Task.await (verifyLicense config.fsPermission projectPath) <| \{} ->
+                Task.await (Task.mapError (\_ -> NoLocalTag) <| Git.hasLocalTag config.cpPermission pkgOutline.version) <| \{} ->
+                Task.await (Task.mapError (\_ -> HasLocalChanges) <| Git.hasNoLocalChangesSinceTag config.cpPermission pkgOutline.version) <| \{} ->
+                    Terminal.PackageInstall.run
+                        { fsPermission = config.fsPermission
+                        , cpPermission = config.cpPermission
+                        , cacheRoot = config.cacheRoot
+                        , interactive = config.interactive
+                        , useColor = config.useColor
+                        , stdout = config.stdout
+                        , stdin = config.stdin
+                        , strictAppResolution = True
+                        }
+                        { projectPath = projectPath, outline = outline }
+                        |> Task.mapError PackageInstallError
+                        |> Task.andThen
+                            (\currentPackage ->
+                                 let
+                                    maybePreviousPackageVersion =
+                                        knownVersions
+                                            |> Array.keepIf (\v -> SemanticVersion.compare v pkgOutline.version == LT)
+                                            |> Array.sortWith SemanticVersion.compare
+                                            |> Array.last
+                                in
+                                when maybePreviousPackageVersion is
+                                    Nothing ->
+                                        Task.succeed
+                                            { projectPath = projectPath
+                                            , knownVersions = knownVersions
+                                            , previousVersion = Nothing
+                                            , currentVersion =
+                                                { outline = currentPackage.outline
+                                                , rootSources = currentPackage.rootSources
+                                                , dependencies = currentPackage.dependencies
+                                                }
+                                            }
+
+                                    Just packageVersion ->
+                                        Git.clonePackageCached
+                                            { childProcessPermission = config.cpPermission
+                                            , fileSystemPermission = config.fsPermission
+                                            , cacheRoot = config.cacheRoot
+                                            , packageName = pkgOutline.name
+                                            , version = packageVersion
+                                            }
+                                            |> Task.mapError (\_ -> PreviousPackageCorrupted)
+                                            |> Task.andThen
+                                                (\repoPath ->
+                                                    Path.append (Path.fromPosixString "gren.json") repoPath
+                                                        |> Terminal.PackageInstall.readOutline config.fsPermission
+                                                        |> Task.mapError (\_ -> PreviousPackageCorrupted)
+                                                        |> Task.andThen
+                                                            (\result ->
+                                                                when result is
+                                                                    Ok decodedOutline ->
+                                                                        Task.succeed decodedOutline
+
+                                                                    Err err ->
+                                                                        Task.fail PreviousPackageCorrupted
+                                                            )
+                                                        |> Task.andThen
+                                                            (\previousOutline ->
+                                                                Terminal.PackageInstall.run
+                                                                    { fsPermission = config.fsPermission
+                                                                    , cpPermission = config.cpPermission
+                                                                    , cacheRoot = config.cacheRoot
+                                                                    , interactive = config.interactive
+                                                                    , useColor = config.useColor
+                                                                    , stdout = config.stdout
+                                                                    , stdin = config.stdin
+                                                                    , strictAppResolution = True
+                                                                    }
+                                                                    { projectPath = repoPath, outline = previousOutline }
+                                                                    |> Task.mapError (\_ -> PreviousPackageCorrupted)
+                                                            )
+                                                )
+                                            |> Task.map
+                                                (\previousPackage ->
+                                                    { projectPath = projectPath
+                                                    , knownVersions = knownVersions
+                                                    , previousVersion =
+                                                        Just
+                                                            { outline = previousPackage.outline
+                                                            , rootSources = previousPackage.rootSources
+                                                            , dependencies = previousPackage.dependencies
+                                                            }
+                                                    , currentVersion =
+                                                        { outline = currentPackage.outline
+                                                        , rootSources = currentPackage.rootSources
+                                                        , dependencies = currentPackage.dependencies
+                                                        }
+                                                    }
+                                                )
+                            )
+
+
+badSummary : String -> Bool
+badSummary summary =
+    String.isEmpty summary || Outline.defaultSummary == summary
+
+
+noExposed : Outline.Exposed -> Bool
+noExposed exposed =
+    when exposed is
+        Outline.ExposedArray modules ->
+            Array.isEmpty modules
+
+        Outline.ExposedDict chunks ->
+            Dict.all (\_ modules -> Array.isEmpty modules) chunks
+
+
+hasLocalDeps : Dict String (Outline.VersionConstraint SemanticVersionRange) -> Bool
+hasLocalDeps dependencies =
+    Dict.any
+        (\_ cons ->
+            when cons is
+                Outline.LocalPath _ ->
+                    True
+
+                Outline.Version _ ->
+                    False
+        )
+        dependencies
+
+
+verifyVersion : SemanticVersion -> Array SemanticVersion -> Task Error {}
+verifyVersion vsn publishedVersions =
+    if Array.isEmpty publishedVersions then
+        if vsn.major == 1 && vsn.minor == 0 && vsn.patch == 0 then
+            Task.succeed {}
+
+        else
+            Task.fail NoPublishedVersionAndNot1
+
+    else
+        Task.succeed {}
+
+
+verifyReadme : FileSystem.Permission -> Path -> Task Error {}
+verifyReadme permission projectPath =
+    let
+        readmePath = Path.append (Path.fromPosixString "README.md") projectPath
+    in
+    FileSystem.readFile permission readmePath
+        |> Task.mapError FailedToReadReadme
+        |> Task.andThen
+            (\content ->
+                if Bytes.length content < 300 then
+                    Task.fail ShortReadme
+
+                else
+                    Task.succeed {}
+            )
+
+
+verifyLicense : FileSystem.Permission -> Path -> Task Error {}
+verifyLicense permission projectPath =
+    FileSystem.checkAccess permission [] (Path.append (Path.fromPosixString "LICENSE") projectPath)
+        |> Task.mapError FailedToReadLicense
+        |> Task.map (\_ -> {})
+
+
+prettifyError : Error -> Report
+prettifyError error =
+    when error is
+        IsApplication ->
+            Report.create
+                "NOT A PACKAGE"
+                Nothing
+                (PP.words "I cannot validate applications, only packages!")
+
+        NoExposedModules ->
+            Report.create
+                "NO EXPOSED MODULES"
+                (Just (Path.fromPosixString "gren.json"))
+                (PP.verticalBlock
+                    [ PP.block
+                        [ PP.text "The "
+                        , PP.color PP.Yellow (PP.text "\"exposed-modules\" ")
+                        , PP.words "field of your gren.json must list at least one module."
+                        ]
+                    , PP.empty
+                    , PP.words
+                        """
+                        Which modules do you want users of the package to have access to? Add their
+                        names to the \"exposed-modules\" list.
+                        """
+                    ]
+                )
+
+        BadSummary ->
+            Report.create
+                "BAD SUMMARY"
+                (Just (Path.fromPosixString "gren.json"))
+                (PP.verticalBlock
+                    [ PP.block
+                        [ PP.words "Every package should have a"
+                        , PP.color PP.Yellow (PP.text " \"summary\" ")
+                        , PP.words "field in the gren.json file that gives a consice overview of the project."
+                        ]
+                    , PP.empty
+                    , PP.words
+                        """
+                        The summary must be less than 80 characters. It should describe
+                        the concrete use of your package as clearly and as plainly as possible.
+                        """
+                    ]
+                )
+
+
+        HasLocalDependencies ->
+            Report.create
+                "FOUND LOCAL DEPENDENCIES"
+                (Just (Path.fromPosixString "gren.json"))
+                ( PP.verticalBlock
+                    [ PP.words
+                        """
+                        When installing a package, all of the package's dependencies are also installed.
+                        Local (on-disk) dependencies cannot be installed over the network, so when you
+                        rely on such a package, no one else can install your package either.
+                        """
+                    , PP.empty
+                    , PP.words
+                        """
+                        Remove all local dependencies (those prefixed with local:) from your gren.json file.
+                        """
+                    ]
+                )
+
+        FailedToFetchVersions gitError ->
+            Git.report
+                "FAILED TO FETCH VERSIONS FOR PACKAGE"
+                "I was attempting to fetch available versions for this package"
+                gitError
+
+        FailedToReadReadme _ ->
+            Report.create
+                "NO README"
+                (Just (Path.fromPosixString "README.md"))
+                (PP.words
+                    """
+                    Every package should have a helpful README.md file, but I do not
+                    see one in your project.
+                    """
+                )
+
+        ShortReadme ->
+            Report.create
+                "SHORT README"
+                (Just (Path.fromPosixString "README.md"))
+                (PP.words
+                    """
+                    This README.md is too short. Having more details will help
+                    people assess your package quickly and fairly.
+                    """
+                )
+
+        FailedToReadLicense _ ->
+            Report.create
+                "NO LICENSE FILE"
+                (Just (Path.fromPosixString "LICENSE"))
+                ( PP.verticalBlock
+                    [ PP.words
+                        """
+                        By making a package available you are inviting the Gren community to build
+                        upon your work. But without knowing your license, we have no idea if that
+                        is legal!                    
+                        """
+                    , PP.empty
+                    , PP.words
+                        """
+                        Once you pick an OSI approved license from <https://spdx.org/licenses/>,
+                        you must share that choice in two places. First, the license identifier
+                        must appear in your gren.json file. Second, the full
+                        license text must appear in the root of your project in a file
+                        named LICENSE. Add that file and you will be all set!
+                        """
+                    ]
+                )
+
+        NoPublishedVersionAndNot1 ->
+            Report.create
+                "BAD VERSION"
+                (Just (Path.fromPosixString "gren.json"))
+                ( PP.words
+                    """
+                    I cannot find a previous published version of this package, but the
+                    version you've set in your gren.json file is not 1.0.0.
+                    """
+                )
+
+        NoLocalTag ->
+            Report.create
+                "NO TAG"
+                Nothing
+                ( PP.verticalBlock
+                    [ PP.words
+                        """
+                        Packages must be tagged in git, but I cannot find a tag for the version
+                        specified in gren.json.
+                        """
+                    , PP.empty
+                    , PP.words
+                        """
+                        Semver formatted tags is how we find a specific package version on GitHub.
+                        """
+                    ]
+                )
+
+        HasLocalChanges ->
+            Report.create
+                "LOCAL CHANGES"
+                Nothing
+                ( PP.words
+                    """
+                    The code in the tagged commit does not match the code in your working
+                    directory. This means you have commits or local changes that are not
+                    going to be available when downloaded!
+                    """
+                )
+
+        PackageInstallError installError ->
+            Terminal.PackageInstall.prettifyError installError
+
+        PreviousPackageCorrupted ->
+            Report.create
+                "CANNOT INSTALL PREVIOUS VERSION OF THIS PACKAGE"
+                Nothing
+                ( PP.verticalBlock
+                    [ PP.words
+                        """
+                        I'm trying to install a previous version of this package in order to
+                        determine if the version bump makes sense, but I'm unable to do so for
+                        some reason.
+                        """
+                    , PP.empty
+                    , PP.words
+                        """
+                        If the previous version of this package was built with an incompatible
+                        version of the Gren compiler, then this isn't really a problem. Simply
+                        bump the version to a new major version number and push the tag.
+                        """
+                    ]
+                )

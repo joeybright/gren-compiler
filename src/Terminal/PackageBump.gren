@@ -1,0 +1,228 @@
+module Terminal.PackageBump exposing
+    ( Config
+    , Options
+    , Error (..)
+    , Result
+    , run
+    , prettifyError
+    )
+
+
+import ChildProcess
+import Compiler.Backend
+import Compiler.PackageName as PackageName exposing (PackageName)
+import Compiler.Paths
+import Compiler.Outline as Outline exposing (Outline)
+import Compiler.Dependencies
+import Git
+import Stream
+import Stream.Log
+import Task exposing (Task)
+import Dict exposing (Dict)
+import FileSystem
+import FileSystem.Path as Path exposing (Path)
+import Bytes exposing (Bytes)
+import SemanticVersion exposing (SemanticVersion)
+import SemanticVersionRange exposing (SemanticVersionRange)
+import Json.Encode as Json
+import Json.Decode as Decode exposing (Decoder)
+import Terminal.PackageInstall
+import Terminal.Help as Help
+import Cli.PrettyPrinter as PP
+import Terminal.Report as Report exposing (Report)
+
+
+type alias Config =
+    { fsPermission : FileSystem.Permission
+    , cpPermission : ChildProcess.Permission
+    , cacheRoot : Compiler.Paths.CacheRoot
+    , interactive : Bool
+    , useColor : Bool
+    , stdout : Stream.Writable Bytes
+    , stdin : Stream.Readable Bytes
+    }
+
+
+type alias Options =
+    { projectPath : Path
+    , outline : Outline
+    }
+
+
+type Error
+    = CannotBumpApplications
+    | VersionFetchError Git.Error
+    | CurrentVersionUnpublished
+    | InstallError Terminal.PackageInstall.PackageInstallError
+    | PreviousPackageCorruption
+
+
+type alias Result =
+    { projectPath : Path
+    , knownVersions : Array SemanticVersion
+    , publishedVersion :
+        { outline : Outline
+        , rootSources : Dict String Compiler.Backend.SourceFile
+        , dependencies : Dict String { path : Path, outline : Outline.PkgOutline, sources : Dict String String }
+        }
+    , currentVersion :
+        { outline : Outline
+        , rootSources : Dict String Compiler.Backend.SourceFile
+        , dependencies : Dict String { path : Path, outline : Outline.PkgOutline, sources : Dict String String }
+        }
+    }
+
+
+run : Config -> Options -> Task Error Result
+run config { projectPath, outline } =
+    when outline is
+        Outline.App _ ->
+            Task.fail CannotBumpApplications
+
+        Outline.Pkg pkgOutline ->
+            Git.fetchVersions config.cpPermission pkgOutline.name
+                |> Task.mapError VersionFetchError
+                |> Task.andThen
+                    (\knownVersions ->
+                        if not <| Array.member pkgOutline.version knownVersions then
+                            Task.fail CurrentVersionUnpublished
+
+                        else
+                            Terminal.PackageInstall.run
+                                { fsPermission = config.fsPermission
+                                , cpPermission = config.cpPermission
+                                , cacheRoot = config.cacheRoot
+                                , interactive = config.interactive
+                                , useColor = config.useColor
+                                , stdout = config.stdout
+                                , stdin = config.stdin
+                                , strictAppResolution = True
+                                }
+                                { projectPath = projectPath, outline = outline }
+                                |> Task.mapError InstallError
+                                |> Task.map
+                                    (\resolved ->
+                                        { packageName = pkgOutline.name
+                                        , packageVersion = pkgOutline.version
+                                        , knownVersions = knownVersions
+                                        , currentPackage = resolved
+                                        }
+                                    )
+                    )
+                |> Task.andThen
+                    (\{ packageName, packageVersion, knownVersions, currentPackage } ->
+                        Git.clonePackageCached
+                            { childProcessPermission = config.cpPermission
+                            , fileSystemPermission = config.fsPermission
+                            , cacheRoot = config.cacheRoot
+                            , packageName = packageName
+                            , version = packageVersion
+                            }
+                            |> Task.mapError (\_ -> PreviousPackageCorruption)
+                            |> Task.andThen
+                                (\repoPath ->
+                                    Path.append (Path.fromPosixString "gren.json") repoPath
+                                        |> Terminal.PackageInstall.readOutline config.fsPermission
+                                        |> Task.mapError (\_ -> PreviousPackageCorruption)
+                                        |> Task.andThen
+                                            (\result ->
+                                                when result is
+                                                    Ok decodedOutline ->
+                                                        Task.succeed decodedOutline
+
+                                                    Err err ->
+                                                        Task.fail PreviousPackageCorruption
+                                            )
+                                        |> Task.andThen
+                                            (\publishedOutline ->
+                                                Terminal.PackageInstall.run
+                                                    { fsPermission = config.fsPermission
+                                                    , cpPermission = config.cpPermission
+                                                    , cacheRoot = config.cacheRoot
+                                                    , interactive = config.interactive
+                                                    , useColor = config.useColor
+                                                    , stdout = config.stdout
+                                                    , stdin = config.stdin
+                                                    , strictAppResolution = True
+                                                    }
+                                                    { projectPath = repoPath, outline = publishedOutline }
+                                                    |> Task.mapError (\_ -> PreviousPackageCorruption)
+                                                    |> Task.map
+                                                        (\resolved ->
+                                                            { currentPackage = currentPackage
+                                                            , publishedPackage = resolved
+                                                            , knownVersions = knownVersions
+                                                            }
+                                                        )
+                                            )
+                                )
+                    )
+                |> Task.map
+                    (\{ currentPackage, publishedPackage, knownVersions } ->
+                        { projectPath = projectPath
+                        , knownVersions = knownVersions
+                        , publishedVersion =
+                            { outline = publishedPackage.outline
+                            , rootSources = publishedPackage.rootSources
+                            , dependencies = publishedPackage.dependencies
+                            }
+                        , currentVersion =
+                            { outline = currentPackage.outline
+                            , rootSources = currentPackage.rootSources
+                            , dependencies = currentPackage.dependencies
+                            }
+                        }
+                    )
+
+
+
+prettifyError : Error -> Report
+prettifyError error =
+    when error is
+        CannotBumpApplications ->
+            Report.create
+                "CANNOT BUMP APPLICATIONS"
+                Nothing
+                ( PP.words
+                    """
+                    This project is defined as an application, so there is no version number to bump.
+                    """
+                )
+
+        CurrentVersionUnpublished ->
+            Report.create
+                "CURRENT VERSION IS NOT PUBLISHED"
+                Nothing
+                ( PP.words
+                    """
+                    The version you're trying to bump from doesn't seem to exist in the remote repository.
+                    """
+                )
+
+        PreviousPackageCorruption ->
+            Report.create
+                "CANNOT BUILD PREVIOUS VERSION"
+                Nothing
+                ( PP.verticalBlock
+                    [ PP.words
+                        """
+                        In order to know what the next version of your package should be, I try to compare your current
+                        code with the previous version of this package.
+                        """
+                    , PP.empty
+                    , PP.words
+                        """
+                        However, I'm unable to build the previous version. Maybe the previous version was built with an
+                        older and incompatible compiler, or the package is corrupt in some way?
+                        """
+                    ]
+                )
+        
+        InstallError installErr ->
+            Terminal.PackageInstall.prettifyError installErr
+        
+        VersionFetchError gitError ->
+            Git.report
+                "FAILED TO FETCH VERSIONS FOR PACKAGE"
+                "I was attempting to fetch available versions for this package"
+                gitError

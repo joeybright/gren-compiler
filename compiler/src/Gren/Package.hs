@@ -2,7 +2,6 @@
 {-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE UnboxedTuples #-}
-{-# OPTIONS_GHC -Wall #-}
 
 module Gren.Package
   ( Name (..),
@@ -51,7 +50,7 @@ import Parse.Primitives qualified as P
 import Reporting.Suggest qualified as Suggest
 import System.FilePath ((</>))
 
--- PACKGE NAMES
+-- PACKAGE NAMES
 
 data Name = Name
   { _author :: !Author,

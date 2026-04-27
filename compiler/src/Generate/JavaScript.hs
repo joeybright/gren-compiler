@@ -13,7 +13,6 @@ import Data.ByteString.Builder qualified as B
 import Data.ByteString.Lazy.Char8 qualified as BLazy
 import Data.Index qualified as Index
 import Data.List qualified as List
-import Data.Map ((!))
 import Data.Map qualified as Map
 import Data.Name qualified as Name
 import Data.Set qualified as Set
@@ -170,71 +169,63 @@ addGlobalHelp mode graph global@(Opt.Global home _) state =
         Set.foldl' (addGlobal mode graph) someState deps
 
       argLookup = makeArgLookup graph
-   in case graph ! global of
-        Opt.Define region (Opt.Function (A.Region funcStart _) args body) deps
+   in case Map.lookup global graph of
+        Nothing ->
+          error ("Compiler bug: failed to find " ++ show global)
+        Just (Opt.Define region (Opt.Function (A.Region funcStart _) args body) deps)
           | length args > 1 ->
               addStmt
                 (addDeps deps state)
-                ( trackedFn region global args (Expr.generateFunctionImplementation mode argLookup home funcStart args body)
-                )
-        Opt.Define region expr deps ->
+                (trackedFn region global args (Expr.generateFunctionImplementation mode argLookup home funcStart args body))
+        Just (Opt.Define region expr deps) ->
           addStmt
             (addDeps deps state)
-            ( trackedVar region global (Expr.generate mode argLookup home expr)
-            )
-        Opt.DefineTailFunc region argNames body deps ->
+            (trackedVar region global (Expr.generate mode argLookup home expr))
+        Just (Opt.DefineTailFunc region argNames body deps) ->
           addStmt
             (addDeps deps state)
             ( let (Opt.Global _ name) = global
                in trackedVar region global (Expr.generateTailDef mode argLookup home name argNames body)
             )
-        Opt.Ctor index arity
+        Just (Opt.Ctor index arity)
           | arity > 1 ->
               addStmt
                 state
-                ( ctor global arity (Expr.generateCtorImplementation mode global index arity)
-                )
-        Opt.Ctor index arity ->
+                (ctor global arity (Expr.generateCtorImplementation mode global index arity))
+        Just (Opt.Ctor index arity) ->
           addStmt
             state
-            ( var global (Expr.generateCtor mode global index arity)
-            )
-        Opt.Link linkedGlobal ->
+            (var global (Expr.generateCtor mode global index arity))
+        Just (Opt.Link linkedGlobal) ->
           addGlobal mode graph state linkedGlobal
-        Opt.Cycle names values functions deps ->
+        Just (Opt.Cycle names values functions deps) ->
           addStmt
             (addDeps deps state)
-            ( generateCycle mode argLookup global names values functions
-            )
-        Opt.Manager effectsType ->
+            (generateCycle mode argLookup global names values functions)
+        Just (Opt.Manager effectsType) ->
           generateManager mode graph global effectsType state
-        Opt.Kernel chunks deps ->
+        Just (Opt.Kernel chunks deps) ->
           addDeps deps (addKernel state (generateKernel mode chunks))
-        Opt.Enum index ->
+        Just (Opt.Enum index) ->
           addStmt
             state
-            ( generateEnum mode global index
-            )
-        Opt.Box ->
+            (generateEnum mode global index)
+        Just Opt.Box ->
           addStmt
             (addGlobal mode graph state identity)
-            ( generateBox mode global
-            )
-        Opt.PortIncoming decoder deps ->
+            (generateBox mode global)
+        Just (Opt.PortIncoming isBytes decoder deps) ->
           addStmt
             (addDeps deps state)
-            ( generatePort mode global "incomingPort" decoder
-            )
-        Opt.PortOutgoing encoder deps ->
+            (generatePort mode global "incomingPort" isBytes decoder)
+        Just (Opt.PortOutgoing isBytes encoder deps) ->
           addStmt
             (addDeps deps state)
-            ( generatePort mode global "outgoingPort" encoder
-            )
-        Opt.PortTask maybeEncoder decoder deps ->
+            (generatePort mode global "outgoingPort" isBytes encoder)
+        Just (Opt.PortTask inputBytes maybeEncoder outputBytes decoder deps) ->
           addStmt
             (addDeps deps state)
-            ( generateTaskPort mode global maybeEncoder decoder
-            )
+            (generateTaskPort mode global inputBytes maybeEncoder outputBytes decoder)
 
 addStmt :: State -> JS.Stmt -> State
 addStmt (State seen builder) stmt =
@@ -402,17 +393,18 @@ identity =
 
 -- GENERATE PORTS
 
-generatePort :: Mode.Mode -> Opt.Global -> Name.Name -> Opt.Expr -> JS.Stmt
-generatePort mode (Opt.Global home name) makePort converter =
+generatePort :: Mode.Mode -> Opt.Global -> Name.Name -> Bool -> Opt.Expr -> JS.Stmt
+generatePort mode (Opt.Global home name) makePort isBytes converter =
   JS.Var (JsName.fromGlobal home name) $
     JS.Call
       (JS.Ref (JsName.fromKernel Name.platform makePort))
       [ JS.String (Name.toBuilder name),
-        Expr.codeToExpr (Expr.generate mode (\_ _ -> Nothing) home converter)
+        Expr.codeToExpr (Expr.generate mode (\_ _ -> Nothing) home converter),
+        JS.Bool isBytes
       ]
 
-generateTaskPort :: Mode.Mode -> Opt.Global -> Maybe Opt.Expr -> Opt.Expr -> JS.Stmt
-generateTaskPort mode (Opt.Global home name) maybeInputConverter outputConverter =
+generateTaskPort :: Mode.Mode -> Opt.Global -> Bool -> Maybe Opt.Expr -> Bool -> Opt.Expr -> JS.Stmt
+generateTaskPort mode (Opt.Global home name) inputIsBytes maybeInputConverter outputIsBytes outputConverter =
   JS.Var
     (JsName.fromGlobal home name)
     ( case maybeInputConverter of
@@ -422,7 +414,9 @@ generateTaskPort mode (Opt.Global home name) maybeInputConverter outputConverter
                 (JS.Ref (JsName.fromKernel Name.platform "taskPort"))
                 [ JS.String (Name.toBuilder name),
                   JS.Null,
-                  Expr.codeToExpr (Expr.generate mode (\_ _ -> Nothing) home outputConverter)
+                  Expr.codeToExpr (Expr.generate mode (\_ _ -> Nothing) home outputConverter),
+                  JS.Bool inputIsBytes,
+                  JS.Bool outputIsBytes
                 ]
             )
             [JS.Null]
@@ -431,7 +425,9 @@ generateTaskPort mode (Opt.Global home name) maybeInputConverter outputConverter
             (JS.Ref (JsName.fromKernel Name.platform "taskPort"))
             [ JS.String (Name.toBuilder name),
               Expr.codeToExpr (Expr.generate mode (\_ _ -> Nothing) home inputConverter),
-              Expr.codeToExpr (Expr.generate mode (\_ _ -> Nothing) home outputConverter)
+              Expr.codeToExpr (Expr.generate mode (\_ _ -> Nothing) home outputConverter),
+              JS.Bool inputIsBytes,
+              JS.Bool outputIsBytes
             ]
     )
 

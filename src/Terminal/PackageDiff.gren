@@ -1,0 +1,319 @@
+module Terminal.PackageDiff exposing
+    ( Config
+    , Options
+    , LocalError (..)
+    , Result
+    , runLocal
+    , prettifyLocalError
+    , GlobalError (..)
+    , runGlobal
+    , prettifyGlobalError
+    )
+
+
+import ChildProcess
+import Compiler.Backend
+import Compiler.PackageName as PackageName exposing (PackageName)
+import Compiler.Paths
+import Compiler.Outline as Outline exposing (Outline)
+import Compiler.Dependencies
+import Git
+import Stream
+import Stream.Log
+import Task exposing (Task)
+import Dict exposing (Dict)
+import FileSystem
+import FileSystem.Path as Path exposing (Path)
+import Bytes exposing (Bytes)
+import SemanticVersion exposing (SemanticVersion)
+import SemanticVersionRange exposing (SemanticVersionRange)
+import Json.Encode as Json
+import Json.Decode as Decode exposing (Decoder)
+import Terminal.PackageInstall
+import Terminal.Help as Help
+import Cli.PrettyPrinter as PP
+import Terminal.Report as Report exposing (Report)
+
+
+type alias Config =
+    { fsPermission : FileSystem.Permission
+    , cpPermission : ChildProcess.Permission
+    , cacheRoot : Compiler.Paths.CacheRoot
+    , interactive : Bool
+    , useColor : Bool
+    , stdout : Stream.Writable Bytes
+    , stdin : Stream.Readable Bytes
+    }
+
+
+type alias Options =
+    { projectPath : Path
+    , outline : Outline
+    }
+
+
+type LocalError
+    = LocalReadProjectOutlineError Terminal.PackageInstall.ReadProjectOutlineError
+    | LocalCannotDiffApplication
+    | LocalFetchVersionsFailed Git.Error
+    | LocalInstallError Terminal.PackageInstall.PackageInstallError
+    | LocalHiddenProjectError InstallHiddenProjectError
+
+
+type alias Result =
+    { projectPath : Path
+    , firstPackage :
+        { outline : Outline
+        , rootSources : Dict String Compiler.Backend.SourceFile
+        , dependencies : Dict String { path : Path, outline : Outline.PkgOutline, sources : Dict String String }
+        }
+    , secondPackage :
+        { outline : Outline
+        , rootSources : Dict String Compiler.Backend.SourceFile
+        , dependencies : Dict String { path : Path, outline : Outline.PkgOutline, sources : Dict String String }
+        }
+    }
+
+
+runLocal : Config -> Maybe SemanticVersion -> Task LocalError Result
+runLocal config maybeVersion =
+    Terminal.PackageInstall.readProjectOutline config.fsPermission
+        |> Task.mapError LocalReadProjectOutlineError
+        |> Task.andThen
+            (\{ projectPath, outline } ->
+                when outline is
+                    Outline.App _ ->
+                        Task.fail LocalCannotDiffApplication
+
+                    Outline.Pkg pkgOutline ->
+                        let
+                            versionTask =
+                                when maybeVersion is
+                                    Just v ->
+                                        Task.succeed v
+
+                                    Nothing ->
+                                        Git.fetchVersions config.cpPermission pkgOutline.name
+                                            |> Task.mapError LocalFetchVersionsFailed
+                                            |> Task.map
+                                                (\knownVersions ->
+                                                    Array.last knownVersions
+                                                        |> Maybe.withDefault
+                                                            { major = 1
+                                                            , minor = 0
+                                                            , patch = 0
+                                                            }
+                                                )
+                        in
+                        versionTask
+                            |> Task.andThen
+                                (\remoteVersion ->
+                                    Terminal.PackageInstall.run
+                                        { fsPermission = config.fsPermission
+                                        , cpPermission = config.cpPermission
+                                        , cacheRoot = config.cacheRoot
+                                        , interactive = config.interactive
+                                        , useColor = config.useColor
+                                        , stdout = config.stdout
+                                        , stdin = config.stdin
+                                        , strictAppResolution = True
+                                        }
+                                        { projectPath = projectPath, outline = outline }
+                                        |> Task.mapError LocalInstallError
+                                        |> Task.map
+                                            (\resolved ->
+                                                { projectPath = projectPath
+                                                , packageName = pkgOutline.name
+                                                , packageVersion = remoteVersion
+                                                , currentPackage = resolved
+                                                }
+                                            )
+                                )
+            )
+        |> Task.andThen
+            (\{ projectPath, packageName, packageVersion, currentPackage } ->
+                installHiddenProject config projectPath packageName packageVersion
+                    |> Task.mapError LocalHiddenProjectError
+                    |> Task.map
+                        (\resolved ->
+                            { projectPath = projectPath
+                            , currentPackage = currentPackage
+                            , remotePackage = resolved
+                            }
+                        )
+            )
+        |> Task.map
+            (\{ projectPath, currentPackage, remotePackage } ->
+                { projectPath = projectPath
+                , firstPackage =
+                    { outline = currentPackage.outline
+                    , rootSources = currentPackage.rootSources
+                    , dependencies = currentPackage.dependencies
+                    }
+                , secondPackage =
+                    { outline = remotePackage.outline
+                    , rootSources = remotePackage.rootSources
+                    , dependencies = remotePackage.dependencies
+                    }
+                }
+            )
+
+
+prettifyLocalError : LocalError -> Report
+prettifyLocalError error =
+    when error is
+        LocalReadProjectOutlineError outlineError ->
+            Terminal.PackageInstall.prettifyProjectOutlineError outlineError
+    
+        LocalCannotDiffApplication ->
+            Report.create
+                "CANNOT DIFF APPLICATIONS"
+                Nothing
+                ( PP.words "This project is an application, but I can only diff packages!" )
+    
+        LocalFetchVersionsFailed gitError ->
+            Git.report
+                "FAILED TO FETCH PACKAGE VERSIONS"
+                "I was attempting to fetch the versions for a package"
+                gitError
+    
+        LocalInstallError installError ->
+            Terminal.PackageInstall.prettifyError installError
+    
+        LocalHiddenProjectError hiddenError ->
+            prettifyHiddenProjectError hiddenError
+    
+
+
+type InstallHiddenProjectError
+    = HiddenProjectGitCloneError Git.Error
+    | HiddenProjectReadOutlineError FileSystem.Error
+    | HiddenProjectOutlineDecodeError Decode.Error
+    | HiddenProjectInstallError Terminal.PackageInstall.PackageInstallError
+
+
+installHiddenProject : Config -> Path -> PackageName -> SemanticVersion -> Task InstallHiddenProjectError Terminal.PackageInstall.PackageResolution
+installHiddenProject config projectPath packageName packageVersion =
+    Git.clonePackageCached
+        { childProcessPermission = config.cpPermission
+        , fileSystemPermission = config.fsPermission
+        , cacheRoot = config.cacheRoot
+        , packageName = packageName
+        , version = packageVersion
+        }
+        |> Task.mapError HiddenProjectGitCloneError
+        |> Task.andThen
+            (\repoPath ->
+                Path.append (Path.fromPosixString "gren.json") repoPath
+                    |> Terminal.PackageInstall.readOutline config.fsPermission
+                    |> Task.mapError HiddenProjectReadOutlineError
+                    |> Task.andThen
+                        (\result ->
+                            when result is
+                                Ok decodedOutline ->
+                                    Task.succeed decodedOutline
+
+                                Err err ->
+                                    Task.fail <| HiddenProjectOutlineDecodeError err
+                        )
+                    |> Task.andThen
+                        (\publishedOutline ->
+                            Terminal.PackageInstall.run
+                                { fsPermission = config.fsPermission
+                                , cpPermission = config.cpPermission
+                                , cacheRoot = config.cacheRoot
+                                , interactive = config.interactive
+                                , useColor = config.useColor
+                                , stdout = config.stdout
+                                , stdin = config.stdin
+                                , strictAppResolution = True
+                                }
+                                { projectPath = repoPath, outline = publishedOutline }
+                                |> Task.mapError HiddenProjectInstallError
+                        )
+            )
+
+
+prettifyHiddenProjectError : InstallHiddenProjectError -> Report
+prettifyHiddenProjectError error =
+    when error is
+        HiddenProjectGitCloneError gitError ->
+            Git.report
+                "FAILED TO FETCH PACKAGE"
+                "I was attempting to fetch a package from GitHub"
+                gitError
+
+        HiddenProjectReadOutlineError fsErr ->
+            Report.create
+                "FAILED TO READ OUTLINE"
+                Nothing
+                (PP.verticalBlock
+                    [ PP.words "An error occured when I attempted to read the gren.json of the requested package."
+                    , PP.empty
+                    , PP.words "The error is:"
+                    , PP.empty
+                    , PP.words (FileSystem.errorToString fsErr)
+                        |> PP.indent
+                    ]
+                )
+
+        HiddenProjectOutlineDecodeError jsonError ->
+            Report.create
+                "FAILED TO READ OUTLINE"
+                Nothing
+                (PP.verticalBlock
+                    [ PP.words "An error occured when I attempted to read the gren.json of the requested package."
+                    , PP.empty
+                    , PP.words "The error is:"
+                    , PP.empty
+                    , PP.words (Decode.errorToString jsonError)
+                        |> PP.indent
+                    ]
+                )
+        
+        HiddenProjectInstallError installError ->
+            Terminal.PackageInstall.prettifyError installError
+        
+
+
+type GlobalError
+    = GlobalReadProjectOutlineError Terminal.PackageInstall.ReadProjectOutlineError
+    | GlobalHiddenProjectError InstallHiddenProjectError
+
+
+runGlobal : Config -> PackageName -> SemanticVersion -> SemanticVersion -> Task GlobalError Result
+runGlobal config packageName lowerVersion upperVersion =
+    -- TODO: Perform application check here when packageName isn't specified
+    Terminal.PackageInstall.readProjectOutline config.fsPermission
+        |> Task.mapError GlobalReadProjectOutlineError
+        |> Task.andThen
+            (\{ projectPath } ->
+                Task.map2
+                    (\firstPackage secondPackage ->
+                        { projectPath = projectPath
+                        , firstPackage =
+                            { outline = firstPackage.outline
+                            , rootSources = firstPackage.rootSources
+                            , dependencies = firstPackage.dependencies
+                            }
+                        , secondPackage =
+                            { outline = secondPackage.outline
+                            , rootSources = secondPackage.rootSources
+                            , dependencies = secondPackage.dependencies
+                            }
+                        }
+                    )
+                    (installHiddenProject config projectPath packageName lowerVersion)
+                    (installHiddenProject config projectPath packageName upperVersion)
+                    |> Task.mapError GlobalHiddenProjectError
+            )
+
+
+prettifyGlobalError : GlobalError -> Report
+prettifyGlobalError error =
+    when error is
+        GlobalReadProjectOutlineError outlineError ->
+            Terminal.PackageInstall.prettifyProjectOutlineError outlineError
+
+        GlobalHiddenProjectError hiddenError ->
+            prettifyHiddenProjectError hiddenError

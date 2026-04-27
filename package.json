@@ -1,30 +1,34 @@
 {
   "name": "gren-lang",
-  "version": "0.5.4",
+  "version": "0.6.5",
   "description": "Compiler for the Gren programming language",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "prepublishOnly": "npx --package=gren-lang@0.4.5 --yes -- gren make src/Main.gren --output=/dev/stdout | terser -c -m -o compiler.js",
-    "build": "npx --package=gren-lang@0.4.5 --yes -- gren make src/Main.gren --output=compiler.js",
-    "prettier": "prettier -w \"!**/*.json\" .",
-    "prettier:check": "prettier -c \"!**/*.json\" ."
+    "prepublishOnly": "scripts/prod_build.sh",
+    "build": "npx --package=gren-lang@0.6.3 gren make Main --output=app",
+    "build:sourcemaps": "npx --package=gren-lang@0.6.3 gren make Main --output=app --sourcemaps",
+    "prettier": "prettier -w index.js",
+    "prettier:check": "prettier -c index.js"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/gren-lang/compiler.git"
   },
+  "funding": "https://ko-fi.com/gren",
   "files": [
     "index.js",
-    "compiler.js",
-    "cli.js"
+    "bin/compiler"
   ],
   "bin": {
-    "gren": "cli.js"
+    "gren": "bin/compiler"
   },
   "keywords": [
     "gren",
     "lang",
-    "language"
+    "language",
+    "compiler",
+    "functional",
+    "programming"
   ],
   "author": "Robin Heggelund Hansen",
   "license": "BSD-3-Clause",
@@ -32,11 +36,13 @@
     "url": "https://github.com/gren-lang/compiler/issues"
   },
   "homepage": "https://gren-lang.org",
-  "dependencies": {
-    "postject": "^1.0.0-alpha.6"
-  },
+  "dependencies": {},
   "devDependencies": {
+    "gren-lang": "0.6.3",
     "prettier": "^3.4.2",
     "terser": "^5.38.1"
+  },
+  "engines": {
+    "node": ">= 22"
   }
 }

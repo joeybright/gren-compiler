@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# OPTIONS_GHC -Wall #-}
 
 module Reporting.Error.Type
   ( Error (..),
@@ -189,7 +188,7 @@ toPatternReport source localizer patternRegion category tipe expected =
                       tipe
                       expectedType
                       (addPatternCategory "The first pattern is trying to match" category)
-                      "But the expression between `when` and `of` is:"
+                      "But the expression between `when` and `is` is:"
                       [ D.reflow $
                           "These can never match! Is the pattern the problem? Or is it the expression?"
                       ]

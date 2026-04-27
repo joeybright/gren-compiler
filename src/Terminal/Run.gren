@@ -1,0 +1,295 @@
+module Terminal.Run exposing
+    ( Error
+    , make
+    , run
+    , prettifyError
+    )
+
+{-| Support the `gren run ModuleName` command.
+-}
+
+import Cli.PrettyPrinter as PP
+import Compiler.PackageName as PackageName exposing (PackageName)
+import Compiler.Backend as Backend
+import Compiler.Paths
+import Bytes exposing (Bytes)
+import ChildProcess
+import Compiler.Backend
+import Compiler.Outline as Outline exposing (Outline)
+import Compiler.Platform as Platform
+import FileSystem
+import FileSystem.Path as Path exposing (Path)
+import Compiler.ModuleName as ModuleName exposing (ModuleName)
+import Git
+import Json.Decode as Decode
+import Node
+import Process
+import Stream
+import Task exposing (Task)
+import Terminal.PackageInstall as PackageInstall exposing (PackageResolution)
+import Terminal.Help as Help
+import Terminal.Report as Report exposing (Report)
+
+
+type Error
+    = ReadProjectOutlineError PackageInstall.ReadProjectOutlineError
+    | PackageInstallError PackageInstall.PackageInstallError
+    | NotAnApplication
+
+
+type alias MakeConfig msg =
+    { fsPermission : FileSystem.Permission
+    , cacheRoot : Compiler.Paths.CacheRoot
+    , cpPermission : ChildProcess.Permission
+    , useColor : Bool
+    , compilerPath : Path
+    , pathToString : Path -> String
+    , moduleName : ModuleName
+    , package : Maybe PackageName
+    , onBackendInitialized : { backendStreams : ChildProcess.StreamIO, encodedCommand : Bytes } -> msg
+    , onCompiled : Path -> Int -> msg
+    }
+
+
+type alias RunConfig msg =
+    { cpPermission : ChildProcess.Permission
+    , fsPermission : FileSystem.Permission
+    , pathToString : Path -> String
+    , path : Path
+    , onInit : Process.Id -> msg
+    , onExit : Int -> msg
+    }
+
+
+type alias ProjectOutline =
+    { projectPath : Path
+    , outline : Outline
+    }
+
+
+make : MakeConfig msg -> Task Error (Cmd msg)
+make config =
+    when config.package is
+        Just packageName ->
+            clonePackage config packageName
+                |> Task.andThen (makeProject config)
+        Nothing ->
+            PackageInstall.readProjectOutline config.fsPermission
+                |> Task.mapError ReadProjectOutlineError
+                |> Task.andThen (makeProject config)
+
+
+makeProject : MakeConfig msg -> ProjectOutline -> Task Error (Cmd msg)
+makeProject config projectOutline =
+    when getOutputPath projectOutline is
+        Nothing ->
+            Task.fail NotAnApplication
+
+        Just { outputType, outputPath } ->
+            let
+                output : Compiler.Backend.MakeOutput
+                output =
+                    outputPath
+                        |> config.pathToString
+                        |> outputType
+
+                installPackages : Stream.Transformation Bytes Bytes -> Task Error PackageResolution
+                installPackages nullStream =
+                    PackageInstall.run
+                        { fsPermission = config.fsPermission
+                        , cpPermission = config.cpPermission
+                        , cacheRoot = config.cacheRoot
+                        , useColor = config.useColor
+                        , interactive = False
+                        , stdout = nullStream |> Stream.writable
+                        , stdin = nullStream |> Stream.readable
+                        , strictAppResolution = True
+                        }
+                        projectOutline
+                            |> Task.mapError PackageInstallError
+
+                backendCommand : PackageResolution -> Bytes
+                backendCommand packageResolution =
+                    Compiler.Backend.encodeCommand
+                        { interactiveSession = False
+                        , pathToString = config.pathToString
+                        }
+                        ( Compiler.Backend.Make
+                            { optimize = False
+                            , sourcemaps = False
+                            , output = Just output
+                            , report = Nothing
+                            , projectPath = packageResolution.projectPath
+                            , entryPoints = [ config.moduleName ]
+                            , outline = packageResolution.outline
+                            , rootSources = packageResolution.rootSources
+                            , dependencies = packageResolution.dependencies
+                            }
+                        )
+
+                compile : Bytes -> Cmd msg
+                compile encodedCommand =
+                    Compiler.Backend.run
+                        config.cpPermission
+                        { useColor = config.useColor
+                        , compilerPath = config.compilerPath
+                        , pathToString = config.pathToString
+                        , onInit = 
+                            (\cpOpts ->
+                                config.onBackendInitialized
+                                    { backendStreams = cpOpts.streams
+                                    , encodedCommand = encodedCommand
+                                    }
+                            )
+                        , onComplete = config.onCompiled outputPath
+                        }
+            in
+            Help.getNullStream
+                |> Task.andThen installPackages
+                |> Task.map backendCommand
+                |> Task.map compile
+
+
+clonePackage : MakeConfig msg -> PackageName -> Task Error ProjectOutline
+clonePackage config packageName =
+    let
+        clone =
+            Git.fetchLatestVersion config.cpPermission packageName
+                |> Task.andThen 
+                    (\version ->
+                        Git.clonePackageCached
+                            { childProcessPermission = config.cpPermission
+                            , fileSystemPermission = config.fsPermission
+                            , cacheRoot = config.cacheRoot
+                            , packageName = packageName
+                            , version = version
+                            }
+                    )
+                |> Task.mapError 
+                    (\e ->
+                        PackageInstallError <|
+                            PackageInstall.PackageInstallGitError <|
+                                { package = packageName
+                                , error = e
+                                }
+                    )
+    in
+    Task.await clone <| \repoDir ->
+    Task.await (getProjectOutline config.fsPermission repoDir) <| \outline ->
+        Task.succeed
+            { projectPath = repoDir
+            , outline = outline
+            }
+
+
+run : RunConfig msg -> Task Error (Cmd msg)
+run config =
+    let
+        getOutline =
+            config.path
+                -- compiled to [project path]/.gren/filename
+                |> Path.parentPath
+                |> Maybe.andThen Path.parentPath
+                |> Maybe.withDefault (Path.fromPosixString ".")
+                |> getProjectOutline config.fsPermission
+    in
+    Task.await getOutline <| \outline ->
+    Task.await Node.getPlatform <| \systemPlatform ->
+        let
+            projectPlatform =
+                when outline is
+                    Outline.Pkg outline_ ->
+                        outline_.platform
+                    Outline.App outline_ ->
+                        outline_.platform
+
+            path =
+                config.pathToString config.path
+            
+            runWith command =
+                ChildProcess.defaultSpawnOptions (ChildProcess.Integrated config.onInit) config.onExit
+                    |> ChildProcess.spawn config.cpPermission command [ path ]
+                    |> Task.succeed
+        in
+        when projectPlatform is
+            Platform.Node ->
+                runWith "node"
+
+            Platform.Common ->
+                Task.fail NotAnApplication
+
+            Platform.Browser ->
+                when systemPlatform is
+                    Node.Win32 ->
+                        runWith "start"
+
+                    _ ->
+                        runWith "open"
+
+
+-- HELPERS
+
+
+getProjectOutline : FileSystem.Permission -> Path -> Task Error Outline
+getProjectOutline fsPermission path =
+    path
+        |> Path.append (Path.fromPosixString "gren.json")
+        |> PackageInstall.readOutline fsPermission
+        |> Task.mapError (PackageInstall.ReadProjectOutlineNoProject >> ReadProjectOutlineError)
+        |> Task.andThen
+            (\decodeResult ->
+                when decodeResult is
+                    Ok outline ->
+                        Task.succeed outline
+                    Err err ->
+                        err
+                            |> PackageInstall.ReadProjectOutlineInvalidGrenJson
+                            |> ReadProjectOutlineError
+                            |> Task.fail
+            )
+
+getOutputPath : ProjectOutline -> Maybe { outputType : (String -> Backend.MakeOutput), outputPath : Path }
+getOutputPath projectOutline =
+    let
+        platform =
+            when projectOutline.outline is
+                Outline.Pkg outline ->
+                    outline.platform
+                Outline.App outline ->
+                    outline.platform
+
+        getPath outputType fileName =
+            { outputType =
+                outputType
+            , outputPath =
+                ".gren/" ++ fileName
+                    |> Path.fromPosixString
+                    |> Path.prepend projectOutline.projectPath
+            }
+    in
+    when platform is
+        Platform.Node ->
+            Just (getPath Backend.Exe "app")
+        Platform.Browser ->
+            Just (getPath Backend.Html "app.html")
+        Platform.Common ->
+            Nothing
+
+
+prettifyError : Error -> Report
+prettifyError error =
+    when error is
+        NotAnApplication ->
+            Report.create
+                "NOT AN APPLICATION"
+                Nothing
+                ( PP.words 
+                    "The module you are trying to run is not an application."
+                )
+
+        ReadProjectOutlineError err ->
+            PackageInstall.prettifyProjectOutlineError err
+
+        PackageInstallError err ->
+            PackageInstall.prettifyError err
+

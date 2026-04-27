@@ -1,10 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# OPTIONS_GHC -Wall #-}
 
 module Optimize.Port
   ( toEncoder,
     toFlagsDecoder,
     toDecoder,
+    isBytes,
   )
 where
 
@@ -18,6 +18,19 @@ import Gren.ModuleName qualified as ModuleName
 import Optimize.Names qualified as Names
 import Reporting.Annotation qualified as A
 import Prelude hiding (maybe, null)
+
+isBytes :: Can.Type -> Bool
+isBytes tipe =
+  case tipe of
+    Can.TAlias _ _ args alias ->
+      isBytes (Type.dealias args alias)
+    Can.TType _ name args ->
+      case args of
+        [] | name == Name.bytes -> True
+        _ ->
+          False
+    _ ->
+      False
 
 -- ENCODE
 
@@ -37,7 +50,7 @@ toEncoder tipe =
           | name == Name.int -> encode "int"
           | name == Name.bool -> encode "bool"
           | name == Name.string -> encode "string"
-          | name == Name.unit -> encode "null"
+          | name == Name.bytes -> Names.registerGlobal A.zero ModuleName.basics Name.identity
           | name == Name.value -> Names.registerGlobal A.zero ModuleName.basics Name.identity
         [arg]
           | name == Name.maybe -> encodeMaybe arg
@@ -47,9 +60,9 @@ toEncoder tipe =
     Can.TRecord _ (Just _) ->
       error "toEncoder: bad record"
     Can.TRecord fields Nothing ->
-      let encodeField (name, Can.FieldType _ fieldType) =
+      let encodeField (name, Can.FieldType _ ft) =
             do
-              encoder <- toEncoder fieldType
+              encoder <- toEncoder ft
               let value = Opt.Call A.zero encoder [Opt.Access (Opt.VarLocal A.zero Name.dollar) A.zero name]
               return $
                 Opt.Record A.zero $
@@ -106,7 +119,7 @@ toDecoder tipe =
           | name == Name.int -> decode "int"
           | name == Name.bool -> decode "bool"
           | name == Name.string -> decode "string"
-          | name == Name.unit -> decodeUnit
+          | name == Name.bytes -> Names.registerGlobal A.zero ModuleName.basics Name.identity
           | name == Name.value -> decode "value"
         [arg]
           | name == Name.maybe -> decodeMaybe arg
@@ -117,15 +130,6 @@ toDecoder tipe =
       error "toDecoder: bad record"
     Can.TRecord fields Nothing ->
       decodeRecord fields
-
--- DECODE UNIT
-
-decodeUnit :: Names.Tracker Opt.Expr
-decodeUnit =
-  do
-    succeed <- decode "succeed"
-    unit <- Names.registerGlobal A.zero ModuleName.basics Name.unit
-    return (Opt.Call A.zero succeed [unit])
 
 -- DECODE MAYBE
 

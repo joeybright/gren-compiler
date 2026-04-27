@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# OPTIONS_GHC -Wall #-}
 
 module Gren.Licenses
   ( License,
@@ -20,6 +19,7 @@ import Reporting.Suggest qualified as Suggest
 
 newtype License
   = License Json.String
+  deriving (Show)
 
 bsd3 :: License
 bsd3 =

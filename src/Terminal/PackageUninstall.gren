@@ -1,0 +1,282 @@
+module Terminal.PackageUninstall exposing
+    ( Error (..)
+    , run
+    , prettifyError
+    )
+
+
+import Cli.PrettyPrinter as PP
+import ChildProcess
+import Compiler.PackageName as PackageName exposing (PackageName)
+import Compiler.Paths
+import Compiler.Outline as Outline exposing (Outline)
+import Compiler.Dependencies
+import Git
+import Stream
+import Stream.Log
+import Task exposing (Task)
+import Dict exposing (Dict)
+import FileSystem
+import FileSystem.Path as Path exposing (Path)
+import Bytes exposing (Bytes)
+import SemanticVersion exposing (SemanticVersion)
+import SemanticVersionRange exposing (SemanticVersionRange)
+import Json.Encode as Json
+import Json.Decode as Decode exposing (Decoder)
+import Terminal.Help as Help
+import Terminal.PackageInstall
+import Terminal.Report as Report exposing (Report)
+
+
+type alias Config =
+    { fsPermission : FileSystem.Permission
+    , cpPermission : ChildProcess.Permission
+    , cacheRoot : Compiler.Paths.CacheRoot
+    , interactive : Bool
+    , useColor : Bool
+    , stdout : Stream.Writable Bytes
+    , stdin : Stream.Readable Bytes
+    }
+
+
+type alias Options =
+    { projectPath : Path
+    , outline : Outline
+    }
+
+
+type Error
+    = PackageNotInstalled
+    | PackageInstallError Terminal.PackageInstall.PackageInstallError
+    | PromptError Stream.Error
+    | UserCancelled
+    | OutlineWriteError FileSystem.Error
+
+
+run : Config -> Options -> PackageName -> Task Error Terminal.PackageInstall.PackageResolution
+run config ({ projectPath, outline } as opts) requestedPackage =
+    let
+        packageNameStr =
+            PackageName.toString requestedPackage
+
+        grenJsonPath =
+            Path.append (Path.fromPosixString "gren.json") projectPath
+    in
+    when outline is
+        Outline.App appOutline ->
+            when
+                { direct = Dict.member packageNameStr appOutline.dependencies.direct
+                , transitive = Dict.member packageNameStr appOutline.dependencies.indirect
+                }
+            is
+                { direct = False, transitive = False } ->
+                    Task.fail PackageNotInstalled
+
+                { direct = True } ->
+                    removeAppPackage config projectPath grenJsonPath appOutline packageNameStr True
+
+                { transitive = True } ->
+                    removeAppPackage config projectPath grenJsonPath appOutline packageNameStr False
+
+        Outline.Pkg pkgOutline ->
+            if not <| Dict.member packageNameStr pkgOutline.dependencies then
+               Task.fail PackageNotInstalled
+
+            else
+                let
+                    finalOutline =
+                        Outline.Pkg
+                            { pkgOutline
+                                | dependencies =
+                                    Dict.remove packageNameStr pkgOutline.dependencies
+                            }
+                in
+                Stream.Log.line config.stdout ("Removing " ++ packageNameStr)
+                    |> Task.andThen
+                        (\packageVersion ->
+                            Terminal.PackageInstall.run
+                                { fsPermission = config.fsPermission
+                                , cpPermission = config.cpPermission
+                                , cacheRoot = config.cacheRoot
+                                , interactive = config.interactive
+                                , useColor = config.useColor
+                                , stdout = config.stdout
+                                , stdin = config.stdin
+                                , strictAppResolution = True
+                                }
+                                { projectPath = projectPath
+                                , outline = finalOutline
+                                }
+                                |> Task.mapError PackageInstallError
+                        )
+                    |> Task.andThen
+                        (\resolved ->
+                            promptUpdateOutline config grenJsonPath finalOutline [ packageNameStr ]
+                                |> Task.map (\{} -> resolved)
+                        )
+
+
+removeAppPackage : Config -> Path -> Path -> Outline.AppOutline -> String -> Bool -> Task Error Terminal.PackageInstall.PackageResolution
+removeAppPackage config projectPath grenJsonPath appOutline packageNameStr isDirect =
+    Stream.Log.line config.stdout ("Removing " ++ packageNameStr)
+        |> Task.andThen
+            (\packageVersion ->
+                Terminal.PackageInstall.run
+                    { fsPermission = config.fsPermission
+                    , cpPermission = config.cpPermission
+                    , cacheRoot = config.cacheRoot
+                    , interactive = config.interactive
+                    , useColor = config.useColor
+                    , stdout = config.stdout
+                    , stdin = config.stdin
+                    , strictAppResolution = True
+                    }
+                    { projectPath = projectPath
+                    , outline =
+                        { appOutline
+                            | dependencies =
+                                if isDirect then
+                                    { appOutline.dependencies | direct = Dict.remove packageNameStr appOutline.dependencies.direct
+                                    }
+
+                                else
+                                    { appOutline.dependencies | indirect = Dict.remove packageNameStr appOutline.dependencies.indirect
+                                    }
+                        }
+                        |> Outline.App
+                    }
+                    |> Task.mapError PackageInstallError
+            )
+        |> Task.andThen
+            (\resolved ->
+                let
+                    originalPackages =
+                        Dict.union appOutline.dependencies.direct appOutline.dependencies.indirect
+
+                    newPackages =
+                        Dict.keys resolved.dependencies
+
+                    finalOutline =
+                        Outline.App
+                            { appOutline
+                                | dependencies =
+                                    { appOutline.dependencies
+                                        | direct = Dict.keepIf (\k _ -> Array.member k newPackages) appOutline.dependencies.direct
+                                        , indirect = Dict.keepIf (\k _ -> Array.member k newPackages) appOutline.dependencies.indirect
+                                    }
+                            }
+
+                    removedPackages =
+                        Dict.keepIf (\k _ -> not <| Array.member k newPackages) originalPackages
+                            |> Dict.keys
+                in
+                promptUpdateOutline config grenJsonPath finalOutline removedPackages
+                    |> Task.map (\{} -> resolved)
+            )
+
+promptUpdateOutline : Config -> Path -> Outline -> Array String -> Task Error {}
+promptUpdateOutline config grenJsonPath finalOutline removedPackages =
+    let
+        plan =
+            PP.verticalBlock
+                [ PP.words "The plan is to remove the following dependencies:"
+                , PP.empty
+                , removedPackages
+                    |> Array.map PP.text
+                    |> PP.verticalBlock
+                    |> PP.indent
+                , PP.empty
+                , PP.words "Do you want me to update the gren.json file accordingly?"
+                ]
+    in
+    Help.confirm
+        { stdout = config.stdout
+        , stdin = config.stdin
+        , useColor = config.useColor
+        , interactive = config.interactive
+        , question = plan
+        , defaultValue = True
+        }
+        |> Task.mapError PromptError
+        |> Task.andThen
+            (\confirmed ->
+                if confirmed then
+                    finalOutline
+                        |> Outline.toJson
+                        |> Json.encode 4
+                        |> Task.succeed
+
+                else
+                    Task.fail UserCancelled
+            )
+        |> Task.andThen
+            (\newOutline ->
+                FileSystem.writeFile config.fsPermission (Bytes.fromString newOutline) grenJsonPath
+                    |> Task.mapError OutlineWriteError
+                    |> Task.map (\_ -> {})
+            )
+
+
+prettifyError : Error -> Report
+prettifyError error =
+    when error is
+        PackageNotInstalled ->
+            Report.create
+                "PACKAGE NOT INSTALLED"
+                Nothing
+                (PP.verticalBlock
+                    [ PP.words "The package you requested to uninstall doesn't seem to be installed in the first place."
+                    , PP.empty
+                    , PP.words "Maybe there's a typo?"
+                    ]
+                )
+        
+        PackageInstallError (Terminal.PackageInstall.PackageInstallMissingIndirectDependency { package }) ->
+            Report.create
+                "FAILED TO UNINSTALL PACKAGE"
+                (Just <| Path.fromPosixString "gren.json")
+                (PP.verticalBlock
+                    [ PP.words ("I could not uninstall " ++ PackageName.toString package ++ " as some other package relies on it.")
+                    , PP.empty
+                    , PP.words "Try to remove this other package first, then try this operation again."
+                    ]
+                )
+
+        PackageInstallError _ ->
+            Report.create
+                "FAILED TO UNINSTALL PACKAGE"
+                (Just <| Path.fromPosixString "gren.json")
+                (PP.words "I cannot seem to resolve your dependencies once I remove the requested package, for some reason.")
+        
+        PromptError streamErr ->
+            Report.create
+                "FAILED TO COMMUNICATE WITH USER"
+                Nothing
+                (PP.verticalBlock
+                    [ PP.words "I wanted to ask you a question, but something seems to be wrong with the stdin stream."
+                    , PP.empty
+                    , PP.words "The error is:"
+                    , PP.empty
+                    , PP.words (Stream.errorToString streamErr)
+                        |> PP.indent
+                    , PP.empty
+                    , PP.words "This is most definetly a bug. Please report it."
+                    ]
+                )
+
+        UserCancelled ->
+            Report.empty
+
+        OutlineWriteError fsErr ->
+            Report.create
+                "FAILED TO UPDATE OUTLINE"
+                Nothing
+                (PP.verticalBlock
+                    [ PP.words "An error occured while I updating the gren.json file."
+                    , PP.empty
+                    , PP.words "The error is:"
+                    , PP.empty
+                    , PP.words (FileSystem.errorToString fsErr)
+                        |> PP.indent
+                    ]
+                )

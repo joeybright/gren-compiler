@@ -1,9 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Reporting.Exit
-  ( Init (..),
-    initToReport,
-    Diff (..),
+  ( Diff (..),
     diffToReport,
     Make (..),
     makeToReport,
@@ -15,16 +13,6 @@ module Reporting.Exit
     replToReport,
     Validate (..),
     validateToReport,
-    Install (..),
-    installToReport,
-    Uninstall (..),
-    uninstallToReport,
-    Outdated (..),
-    outdatedToReport,
-    Format (..),
-    FormattingFailure (..),
-    ValidateFailure (..),
-    formatToReport,
     newPackageOverview,
     --
     Solver (..),
@@ -48,11 +36,8 @@ import Data.ByteString qualified as BS
 import Data.ByteString.UTF8 qualified as BS_UTF8
 import Data.List qualified as List
 import Data.Map qualified as Map
-import Data.Maybe (mapMaybe)
 import Data.Name qualified as N
 import Data.NonEmptyList qualified as NE
-import File qualified
-import Git qualified
 import Gren.Constraint qualified as C
 import Gren.Magnitude qualified as M
 import Gren.ModuleName qualified as ModuleName
@@ -68,7 +53,6 @@ import Reporting.Doc qualified as D
 import Reporting.Error qualified as Error
 import Reporting.Error.Import qualified as Import
 import Reporting.Error.Json qualified as Json
-import Reporting.Error.Syntax qualified as Error.Syntax
 import Reporting.Exit.Help qualified as Help
 import Reporting.Render.Code qualified as Code
 import System.FilePath ((<.>), (</>))
@@ -87,66 +71,6 @@ toStderr report =
 toJson :: Help.Report -> Encode.Value
 toJson report =
   Help.reportToJson report
-
--- INIT
-
-data Init
-  = InitNoSolution [Pkg.Name]
-  | InitSolverProblem Solver
-  | InitAlreadyExists
-  | InitNoCompatibleDependencies (Maybe Git.Error)
-
-initToReport :: Init -> Help.Report
-initToReport exit =
-  case exit of
-    InitNoSolution pkgs ->
-      Help.report
-        "NO SOLUTION"
-        Nothing
-        "I tried to create an gren.json with the following direct dependencies:"
-        [ D.indent 4 $
-            D.vcat $
-              map (D.dullyellow . D.fromChars . Pkg.toChars) pkgs,
-          D.reflow $
-            "I could not find compatible versions though! This should not happen, so please\
-            \ ask around one of the community forums at https://gren-lang.org/community to learn\
-            \ what is going on!"
-        ]
-    InitSolverProblem solver ->
-      toSolverReport solver
-    InitAlreadyExists ->
-      Help.report
-        "EXISTING PROJECT"
-        Nothing
-        "You already have an gren.json file, so there is nothing for me to initialize!"
-        [ D.fillSep
-            [ "Maybe",
-              D.green (D.fromChars (D.makeLink "init")),
-              "can",
-              "help",
-              "you",
-              "figure",
-              "out",
-              "what",
-              "to",
-              "do",
-              "next?"
-            ]
-        ]
-    InitNoCompatibleDependencies Nothing ->
-      Help.report
-        "NO COMPATIBLE DEPENDENCIES"
-        Nothing
-        "I failed to find versions of the core packages which are compatible with your current\
-        \ Gren compiler. "
-        [ D.reflow "Maybe you need to update the compiler?"
-        ]
-    InitNoCompatibleDependencies (Just gitError) ->
-      toGitErrorReport
-        "FAILED TO LOAD DEPENDENCIES"
-        gitError
-        "I tried to find the latest compatible versions of some core packages, but failed\
-        \ due to a problem with Git. I use Git to download external dependencies from Github."
 
 -- DIFF
 
@@ -204,12 +128,11 @@ diffToReport diff =
       Help.report
         "UNKNOWN PACKAGE"
         Nothing
-        ( "I cannot find a package called:"
-        )
+        ("I cannot find a package called:")
         [ D.indent 4 $ D.red $ D.fromChars $ Pkg.toChars pkg,
           "Maybe you want one of these instead?",
           D.indent 4 $ D.dullyellow $ D.vcat $ map (D.fromChars . Pkg.toChars) suggestions,
-          "But check <https://package.gren-lang.org> to see all possibilities!"
+          "But check <https://packages.gren-lang.org> to see all possibilities!"
         ]
     DiffUnknownVersion _pkg vsn realVersions ->
       Help.docReport
@@ -302,7 +225,7 @@ bumpToReport bump =
               "that",
               "version",
               "on",
-              "<https://package.gren-lang.org>.",
+              "<https://packages.gren-lang.org>.",
               "That",
               "means",
               "there",
@@ -473,7 +396,6 @@ data Validate
   | ValidateMissingTag V.Version
   | ValidateNoGit
   | ValidateLocalChanges V.Version
-  | ValidateUnsignedKernelCode
 
 validateToReport :: Validate -> Help.Report
 validateToReport validate =
@@ -824,21 +746,6 @@ validateToReport validate =
                 ]
             )
             []
-    ValidateUnsignedKernelCode ->
-      Help.report
-        "UNSIGNED KERNEL CODE"
-        Nothing
-        "This package contains kernel code which hasn't been signed by Gren's\
-        \ lead developer."
-        [ D.reflow $
-            "Kernel code allows you to break every guarantee that Gren provides.\
-            \ Values can be mutated, exceptions can be thrown, side-effects can happen\
-            \ everywhere. Kernel code is only designed for use in the runtime or when\
-            \ implementing core APIs. It is not meant to be used by regular developers.",
-          D.toSimpleNote $
-            "You will need to get your kernel code changes signed by the lead developer\
-            \ of Gren, or remove them."
-        ]
 
 toBadReadmeReport :: String -> String -> Help.Report
 toBadReadmeReport title summary =
@@ -868,7 +775,7 @@ toBadReadmeReport title summary =
 -- DOCS
 
 data DocsProblem
-  = DP_Git Git.Error
+  = DP_Git ()
   | DP_Data String BS.ByteString
   | DP_Cache
 
@@ -911,175 +818,6 @@ toDocsProblemReport problem context =
             \ for some reason."
         ]
 
--- INSTALL
-
-data Install
-  = InstallNoOutline
-  | InstallBadOutline Outline
-  | InstallNoOnlineAppSolution Pkg.Name
-  | InstallNoOnlinePkgSolution Pkg.Name
-  | InstallHadSolverTrouble Solver
-  | InstallNoSolverSolution
-  | InstallNoCompatiblePkg Pkg.Name
-  | InstallUnknownPackageOnline Pkg.Name [Pkg.Name]
-  | InstallBadDetails Details
-
-installToReport :: Install -> Help.Report
-installToReport exit =
-  case exit of
-    InstallNoOutline ->
-      Help.report
-        "NEW PROJECT?"
-        Nothing
-        "Are you trying to start a new project? Try this command instead:"
-        [ D.indent 4 $ D.green "gren init",
-          D.reflow "It will help you get started!"
-        ]
-    InstallBadOutline outline ->
-      toOutlineReport outline
-    InstallNoOnlineAppSolution pkg ->
-      Help.report
-        "CANNOT FIND COMPATIBLE VERSION"
-        (Just "gren.json")
-        ( "I cannot find a version of "
-            ++ Pkg.toChars pkg
-            ++ " that is compatible\
-               \ with your existing dependencies."
-        )
-        [ D.reflow $
-            "I checked all the semver-formatted tags. When that failed, I tried to find any\
-            \ compatible combination of these packages, even if it meant changing all your\
-            \ existing dependencies! That did not work either!",
-          D.reflow $
-            "This is most likely to happen when a package is not upgraded yet. Maybe a new\
-            \ version of Gren came out recently? Maybe a common package was changed recently?\
-            \ Maybe a better package came along, so there was no need to upgrade this one?\
-            \ Try asking around https://gren-lang.org/community to learn what might be going on\
-            \ with this package.",
-          D.toSimpleNote $
-            "Whatever the case, please be kind to the relevant package authors! Having\
-            \ friendly interactions with users is great motivation, and conversely, getting\
-            \ berated by strangers on the internet sucks your soul dry. Furthermore, package\
-            \ authors are humans with families, friends, jobs, vacations, responsibilities,\
-            \ goals, etc. They face obstacles outside of their technical work you will never\
-            \ know about, so please assume the best and try to be patient and supportive!"
-        ]
-    InstallNoOnlinePkgSolution pkg ->
-      Help.report
-        "CANNOT FIND COMPATIBLE VERSION"
-        (Just "gren.json")
-        ( "I cannot find a version of "
-            ++ Pkg.toChars pkg
-            ++ " that is compatible\
-               \ with your existing constraints."
-        )
-        [ D.reflow $
-            "With applications, I try to broaden the constraints to see if anything works,\
-            \ but messing with package constraints is much more delicate business. E.g. making\
-            \ your constraints stricter may make it harder for applications to find compatible\
-            \ dependencies. So fixing something here may break it for a lot of other people!",
-          D.reflow $
-            "So I recommend making an application with the same dependencies as your package.\
-            \ See if there is a solution at all. From there it may be easier to figure out\
-            \ how to proceed in a way that will disrupt your users as little as possible. And\
-            \ the solution may be to help other package authors to get their packages updated,\
-            \ or to drop a dependency entirely."
-        ]
-    InstallHadSolverTrouble solver ->
-      toSolverReport solver
-    InstallNoSolverSolution ->
-      Help.report
-        "COULD NOT RESOLVE DEPENDENCIES"
-        (Just "gren.json")
-        ( "I could not find a compatible set of dependencies."
-        )
-        []
-    InstallNoCompatiblePkg pkg ->
-      Help.report
-        "CANNOT FIND COMPATIBLE VERSION"
-        (Just "gren.json")
-        ( "I cannot find a version of "
-            ++ Pkg.toChars pkg
-            ++ " that is compatible with your current Gren compiler."
-        )
-        [ D.reflow $
-            "You'll have to wait for the package to release a version with support for your\
-            \ current Gren compiler, or upgrade."
-        ]
-    InstallUnknownPackageOnline pkg suggestions ->
-      Help.docReport
-        "UNKNOWN PACKAGE"
-        Nothing
-        ( D.fillSep
-            ["I", "cannot", "find", "a", "package", "named", D.red (D.fromPackage pkg) <> "."]
-        )
-        [ D.reflow $
-            "I looked through https://package.gren-lang.org for packages with similar names\
-            \ and found these:",
-          D.indent 4 $ D.dullyellow $ D.vcat $ map D.fromPackage suggestions,
-          D.reflow $ "Maybe you want one of these instead?"
-        ]
-    InstallBadDetails details ->
-      toDetailsReport details
-
--- UNINSTALL
-
-data Uninstall
-  = UninstallNoOutline
-  | UninstallBadOutline Outline
-  | UninstallHadSolverTrouble Solver
-  | UninstallNoSolverSolution
-  | UninstallBadDetails Details
-
-uninstallToReport :: Uninstall -> Help.Report
-uninstallToReport exit =
-  case exit of
-    UninstallNoOutline ->
-      Help.report
-        "COULD NOT FIND PROJECT"
-        Nothing
-        "I could not locate the gren.json file of your project."
-        []
-    UninstallBadOutline outline ->
-      toOutlineReport outline
-    UninstallHadSolverTrouble solver ->
-      toSolverReport solver
-    UninstallNoSolverSolution ->
-      Help.report
-        "COULD NOT RESOLVE DEPENDENCIES"
-        (Just "gren.json")
-        ( "After removing the package I was unable to resolve your project's dependencies.\
-          \ I'm not sure how this can happen. It might be a good idea to reach out to the Gren\
-          \ core team."
-        )
-        []
-    UninstallBadDetails details ->
-      toDetailsReport details
-
--- OUTDATED
-
-data Outdated
-  = OutdatedNoOutline
-  | OutdatedBadOutline Outline
-  | OutdatedGitTrouble Git.Error
-
-outdatedToReport :: Outdated -> Help.Report
-outdatedToReport exit =
-  case exit of
-    OutdatedNoOutline ->
-      Help.report
-        "COULD NOT FIND PROJECT"
-        Nothing
-        "I could not locate the gren.json file of your project."
-        []
-    OutdatedBadOutline outline ->
-      toOutlineReport outline
-    OutdatedGitTrouble gitError ->
-      toGitErrorReport
-        "PROBLEM FINDING OUTDATED PACKAGE VERSIONS"
-        gitError
-        "I tried to find newer versions of the dependencies specified in your gren.json file."
-
 -- SOLVER
 
 data Solver
@@ -1089,8 +827,8 @@ data Solver
   | SolverBadLocalDepInvalidGrenJson FilePath Pkg.Name
   | SolverLocalDepNotFound FilePath Pkg.Name
   | SolverTransientLocalDep Pkg.Name Pkg.Name
-  | SolverBadGitOperationUnversionedPkg Pkg.Name Git.Error
-  | SolverBadGitOperationVersionedPkg Pkg.Name V.Version Git.Error
+  | SolverBadGitOperationUnversionedPkg Pkg.Name ()
+  | SolverBadGitOperationVersionedPkg Pkg.Name V.Version ()
   | SolverIncompatibleSolvedVersion Pkg.Name Pkg.Name C.Constraint V.Version
   | SolverIncompatibleVersionRanges Pkg.Name Pkg.Name C.Constraint C.Constraint
   | SolverIncompatiblePlatforms Pkg.Name Platform.Platform Platform.Platform
@@ -2061,49 +1799,51 @@ toDetailsReport details =
 
 --
 
-toGitErrorReport :: String -> Git.Error -> String -> Help.Report
-toGitErrorReport title err context =
-  let toGitReport intro details =
-        Help.report title Nothing intro details
-   in case err of
-        Git.MissingGit ->
-          toGitReport
-            (context ++ ", but I couldn't find a git binary.")
-            [ D.reflow
-                "I use git to clone dependencies from github.\
-                \ Make sure that git is installed and present in your PATH."
-            ]
-        Git.NoVersions ->
-          toGitReport
-            (context ++ ", but I couldn't find any semver compatible tags in this repo.")
-            [ D.reflow
-                "Gren packages are just git repositories with tags following the \
-                \ semantic versioning scheme. However, it seems that this particular repo \
-                \ doesn't have _any_ semantic version tags!"
-            ]
-        Git.NoSuchRepo ->
-          toGitReport
-            (context ++ ", but I couldn't find the repo on github.")
-            [ D.reflow
-                "Gren packages are just git repositories hosted on github, however \
-                \ it seems like this repo doesn't exist."
-            ]
-        Git.NoSuchRepoOrVersion vsn ->
-          toGitReport
-            (context ++ ", but I couldn't find the correct version of this package on github.")
-            [ D.reflow $
-                "Gren packages are just git repositories hosted on github with semver \
-                \ formatted tags. However, it seems like this package, or version "
-                  ++ V.toChars vsn
-                  ++ ", doesn't exist."
-            ]
-        Git.FailedCommand args errorMsg ->
-          toGitReport
-            (context ++ ", so I tried to execute:")
-            [ D.indent 4 $ D.reflow $ unwords args,
-              D.reflow "But it returned the following error message:",
-              D.indent 4 $ D.reflow errorMsg
-            ]
+toGitErrorReport :: String -> () -> String -> Help.Report
+toGitErrorReport title _ _ =
+  Help.report title Nothing "" []
+
+--   let toGitReport intro details =
+--         Help.report title Nothing intro details
+--    in case err of
+--         Git.MissingGit ->
+--           toGitReport
+--             (context ++ ", but I couldn't find a git binary.")
+--             [ D.reflow
+--                 "I use git to clone dependencies from github.\
+--                 \ Make sure that git is installed and present in your PATH."
+--             ]
+--         Git.NoVersions ->
+--           toGitReport
+--             (context ++ ", but I couldn't find any semver compatible tags in this repo.")
+--             [ D.reflow
+--                 "Gren packages are just git repositories with tags following the \
+--                 \ semantic versioning scheme. However, it seems that this particular repo \
+--                 \ doesn't have _any_ semantic version tags!"
+--             ]
+--         Git.NoSuchRepo ->
+--           toGitReport
+--             (context ++ ", but I couldn't find the repo on github.")
+--             [ D.reflow
+--                 "Gren packages are just git repositories hosted on github, however \
+--                 \ it seems like this repo doesn't exist."
+--             ]
+--         Git.NoSuchRepoOrVersion vsn ->
+--           toGitReport
+--             (context ++ ", but I couldn't find the correct version of this package on github.")
+--             [ D.reflow $
+--                 "Gren packages are just git repositories hosted on github with semver \
+--                 \ formatted tags. However, it seems like this package, or version "
+--                   ++ V.toChars vsn
+--                   ++ ", doesn't exist."
+--             ]
+--         Git.FailedCommand args errorMsg ->
+--           toGitReport
+--             (context ++ ", so I tried to execute:")
+--             [ D.indent 4 $ D.reflow $ unwords args,
+--               D.reflow "But it returned the following error message:",
+--               D.indent 4 $ D.reflow errorMsg
+--             ]
 
 -- MAKE
 
@@ -2211,8 +1951,8 @@ makeToReport make =
         Nothing
         "What should I make though? I need specific files like:"
         [ D.vcat
-            [ D.indent 4 $ D.green "gren make src/Main.gren",
-              D.indent 4 $ D.green "gren make src/This.gren src/That.gren"
+            [ D.indent 4 $ D.green "gren make Main",
+              D.indent 4 $ D.green "gren make This That"
             ],
           D.reflow $
             "I recommend reading through https://gren-lang.org/learn for guidance on what to\
@@ -2224,8 +1964,8 @@ makeToReport make =
         Nothing
         "What should I make though? I need specific files like:"
         [ D.vcat
-            [ D.indent 4 $ D.green "gren make src/Main.gren",
-              D.indent 4 $ D.green "gren make src/This.gren src/That.gren"
+            [ D.indent 4 $ D.green "gren make Main",
+              D.indent 4 $ D.green "gren make This That"
             ],
           D.reflow $
             "You can also entries to the \"exposed-modules\" list in your gren.json file, and\
@@ -2235,8 +1975,7 @@ makeToReport make =
       Help.report
         "TOO MANY FILES"
         Nothing
-        ( "When producing an HTML file or executable, I can only handle one file."
-        )
+        ("When producing an HTML file or executable, I can only handle one file.")
         [ D.fillSep
             [ "Switch",
               "to",
@@ -2366,7 +2105,7 @@ makeToReport make =
                   D.indent 2 $ D.fillSep [D.cyan "Html" <> ".text", D.dullyellow "\"Hello!\""]
                 ],
               D.reflow $
-                "Or use https://package.gren-lang.org/packages/gren/core/latest/Platform#worker to\
+                "Or use https://packages.gren-lang.org/package/gren-lang/core/latest/module/Platform#worker to\
                 \ make a `main` with no user interface."
             ]
         _ : _ ->
@@ -2393,7 +2132,7 @@ makeToReport make =
                   D.indent 2 $ D.fillSep [D.cyan "Html" <> ".text", D.dullyellow "\"Hello!\""]
                 ],
               D.reflow $
-                "Or use https://package.gren-lang.org/packages/gren/core/latest/Platform#worker to\
+                "Or use https://packages.gren-lang.org/package/gren-lang/core/latest/module/Platform#worker to\
                 \ make a `main` with no user interface."
             ]
     MakeCannotBuild buildProblem ->
@@ -2404,8 +2143,7 @@ makeToReport make =
       Help.report
         "HTML FILES CAN ONLY BE CREATED FOR BROWSER PLATFORM"
         Nothing
-        ( "When producing a HTML file, I require that the project platform is `browser`."
-        )
+        ("When producing a HTML file, I require that the project platform is `browser`.")
         [ D.reflow $
             "Try changing the `target` value in `gren.json` to `browser`.\
             \ alternatively, pass a filename ending with `.js` to the compiler."
@@ -2414,8 +2152,7 @@ makeToReport make =
       Help.report
         "EXECUTABLES CAN ONLY BE CREATED FOR NODE PLATFORM"
         Nothing
-        ( "When producing an executable, I require that the project platform is `node`."
-        )
+        ("When producing an executable, I require that the project platform is `node`.")
         [ D.reflow $
             "Try changing the `target` value in `gren.json` to `node`.\
             \ alternatively, pass a filename ending with `.js` to the compiler."
@@ -2695,7 +2432,7 @@ replToReport problem =
     ReplBadDetails details ->
       toDetailsReport details
     ReplBadInput source err ->
-      Help.compilerReport "/" (Error.Module N.replModule "REPL" File.zeroTime source err) []
+      Help.compilerReport "/" (Error.Module N.replModule "REPL" source err) []
     ReplBadLocalDeps root e es ->
       Help.compilerReport root e es
     ReplProjectProblem projectProblem ->
@@ -2706,78 +2443,3 @@ replToReport problem =
       corruptCacheReport
     ReplBlocked ->
       corruptCacheReport
-
--- FORMAT
-
-data Format
-  = FormatPathUnknown FilePath
-  | FormatStdinWithFiles
-  | FormatNoOutline
-  | FormatBadOutline Outline
-  | FormatValidateErrors (NE.List ValidateFailure)
-  | FormatErrors (NE.List FormattingFailure)
-
-data FormattingFailure
-  = FormattingFailureParseError (Maybe FilePath) BS.ByteString Error.Syntax.Error
-
-data ValidateFailure
-  = VaildateFormattingFailure FormattingFailure
-  | ValidateNotCorrectlyFormatted
-
-formatToReport :: Format -> Help.Report
-formatToReport problem =
-  case problem of
-    FormatPathUnknown path ->
-      Help.report
-        "FILE NOT FOUND"
-        Nothing
-        "I cannot find this file:"
-        [ D.indent 4 $ D.red $ D.fromChars path,
-          D.reflow $ "Is there a typo?",
-          D.toSimpleNote $
-            "If you are just getting started, try working through the examples in the\
-            \ official guide https://gren-lang.org/learn to get an idea of the kinds of things\
-            \ that typically go in a src/Main.gren file."
-        ]
-    FormatStdinWithFiles ->
-      Help.report
-        "INCOMPATIBLE FLAGS"
-        Nothing
-        "Files and stdin cannot be formatted at the same time."
-        [ D.reflow "You'll need to run `gren format` two separate times if you want to do both."
-        ]
-    FormatNoOutline ->
-      Help.report
-        "FORMAT WHAT?"
-        Nothing
-        "I cannot find a gren.json so I am not sure what you want me to format.\
-        \ Normally you run `gren format` from within a project!"
-        [ D.reflow $ "If you need to format gren files outside of a project, tell me which files or directories to format:",
-          D.indent 4 $ D.green $ "gren format Example.gren"
-        ]
-    FormatBadOutline outline ->
-      toOutlineReport outline
-    FormatValidateErrors errors ->
-      Help.report
-        "FILES NOT PROPERLY FORMATTED"
-        Nothing
-        "The input files were not correctly formatted according to Gren's preferred style."
-        (mapMaybe validateErrorToDoc $ NE.toList errors)
-    FormatErrors errors ->
-      Help.report
-        (show (length errors) <> " FILES CONTAINED ERRORS")
-        Nothing
-        "Some files contained errors and could not be formatted:"
-        (formattingErrorToDoc <$> NE.toList errors)
-
-formattingErrorToDoc :: FormattingFailure -> D.Doc
-formattingErrorToDoc formattingError =
-  case formattingError of
-    FormattingFailureParseError path source err ->
-      Help.syntaxErrorToDoc (Code.toSource source) path err
-
-validateErrorToDoc :: ValidateFailure -> Maybe D.Doc
-validateErrorToDoc validateError =
-  case validateError of
-    VaildateFormattingFailure formattingFailure -> Just $ formattingErrorToDoc formattingFailure
-    ValidateNotCorrectlyFormatted -> Nothing

@@ -6,6 +6,7 @@
 module Build
   ( fromExposed,
     fromPaths,
+    fromMainModules,
     fromRepl,
     Artifacts (..),
     Root (..),
@@ -14,6 +15,8 @@ module Build
     ReplArtifacts (..),
     DocsGoal (..),
     getRootNames,
+    Source (..),
+    Sources,
   )
 where
 
@@ -27,9 +30,11 @@ import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar
 import Control.Monad (filterM)
 import Data.ByteString qualified as B
+import Data.ByteString.Internal (ByteString)
 import Data.Char qualified as Char
 import Data.Graph qualified as Graph
 import Data.List qualified as List
+import Data.Map (Map)
 import Data.Map.Strict ((!))
 import Data.Map.Strict qualified as Map
 import Data.Map.Utils qualified as Map
@@ -58,7 +63,7 @@ import Reporting.Error.Syntax qualified as Syntax
 import Reporting.Exit qualified as Exit
 import Reporting.Render.Type.Localizer qualified as L
 import System.Directory qualified as Dir
-import System.FilePath ((<.>), (</>))
+import System.FilePath ((<.>))
 import System.FilePath qualified as FP
 
 -- ENVIRONMENT
@@ -69,22 +74,21 @@ data Env = Env
     _project :: Parse.ProjectType,
     _platform :: P.Platform,
     _srcDirs :: [AbsoluteSrcDir],
-    _buildID :: Details.BuildID,
     _locals :: Map.Map ModuleName.Raw Details.Local,
     _foreigns :: Map.Map ModuleName.Raw Details.Foreign
   }
 
 makeEnv :: Reporting.BKey -> FilePath -> Details.Details -> IO Env
-makeEnv key root (Details.Details _ validOutline buildID locals foreigns _) =
+makeEnv key root (Details.Details _ validOutline _ locals foreigns _) =
   case validOutline of
     Details.ValidApp platform givenSrcDirs ->
       do
         srcDirs <- traverse (Outline.toAbsoluteSrcDir root) (NE.toList givenSrcDirs)
-        return $ Env key root Parse.Application platform srcDirs buildID locals foreigns
+        return $ Env key root Parse.Application platform srcDirs locals foreigns
     Details.ValidPkg platform pkg _ ->
       do
         srcDir <- Outline.toAbsoluteSrcDir root (Outline.RelativeSrcDir "src")
-        return $ Env key root (Parse.Package pkg) platform [srcDir] buildID locals foreigns
+        return $ Env key root (Parse.Package pkg) platform [srcDir] locals foreigns
 
 -- FORK
 
@@ -105,8 +109,16 @@ forkWithKey func dict =
 
 -- FROM EXPOSED
 
-fromExposed :: Reporting.Style -> FilePath -> Details.Details -> DocsGoal docs -> NE.List ModuleName.Raw -> IO (Either Exit.BuildProblem docs)
-fromExposed style root details docsGoal exposed@(NE.List e es) =
+data Source = Source
+  { _source_path :: FilePath,
+    _source_data :: ByteString
+  }
+  deriving (Show)
+
+type Sources = Map ModuleName.Raw Source
+
+fromExposed :: Reporting.Style -> FilePath -> Details.Details -> Sources -> DocsGoal docs -> NE.List ModuleName.Raw -> IO (Either Exit.BuildProblem docs)
+fromExposed style root details sources docsGoal exposed@(NE.List e es) =
   Reporting.trackBuild style $ \key ->
     do
       env <- makeEnv key root details
@@ -115,7 +127,7 @@ fromExposed style root details docsGoal exposed@(NE.List e es) =
       -- crawl
       mvar <- newEmptyMVar
       let docsNeed = toDocsNeed docsGoal
-      roots <- Map.fromKeysA (fork . crawlModule env mvar docsNeed) (e : es)
+      roots <- Map.fromKeysA (fork . crawlModule env mvar sources docsNeed) (e : es)
       putMVar mvar roots
       mapM_ readMVar roots
       statuses <- traverse readMVar =<< readMVar mvar
@@ -150,8 +162,8 @@ data Module
 type Dependencies =
   Map.Map ModuleName.Canonical I.DependencyInterface
 
-fromPaths :: Reporting.Style -> FilePath -> Details.Details -> NE.List FilePath -> IO (Either Exit.BuildProblem Artifacts)
-fromPaths style root details paths =
+fromPaths :: Reporting.Style -> FilePath -> Details.Details -> Sources -> NE.List FilePath -> IO (Either Exit.BuildProblem Artifacts)
+fromPaths style root details sources paths =
   Reporting.trackBuild style $ \key ->
     do
       env <- makeEnv key root details
@@ -165,7 +177,7 @@ fromPaths style root details paths =
             -- crawl
             dmvar <- Details.loadInterfaces root details
             smvar <- newMVar Map.empty
-            srootMVars <- traverse (fork . crawlRoot env smvar) lroots
+            srootMVars <- traverse (fork . crawlRoot env smvar sources) lroots
             sroots <- traverse readMVar srootMVars
             statuses <- traverse readMVar =<< readMVar smvar
 
@@ -179,10 +191,38 @@ fromPaths style root details paths =
                   rmvar <- newEmptyMVar
                   resultsMVars <- forkWithKey (checkModule env foreigns rmvar) statuses
                   putMVar rmvar resultsMVars
-                  rrootMVars <- traverse (fork . checkRoot env resultsMVars) sroots
+                  rrootMVars <- traverse (fork . checkRoot) sroots
                   results <- traverse readMVar resultsMVars
                   writeDetails root details results
                   toArtifacts env foreigns results <$> traverse readMVar rrootMVars
+
+fromMainModules :: Reporting.Style -> FilePath -> Details.Details -> Sources -> NE.List ModuleName.Raw -> IO (Either Exit.BuildProblem Artifacts)
+fromMainModules style root details sources rootModules =
+  Reporting.trackBuild style $ \key ->
+    do
+      env <- makeEnv key root details
+
+      -- crawl
+      dmvar <- Details.loadInterfaces root details
+      smvar <- newMVar Map.empty
+      srootMVars <- traverse (fork . crawlRootModule env smvar sources) rootModules
+      sroots <- traverse readMVar srootMVars
+      statuses <- traverse readMVar =<< readMVar smvar
+
+      midpoint <- checkMidpointAndRoots dmvar statuses sroots
+      case midpoint of
+        Left problem ->
+          return (Left (Exit.BuildProjectProblem problem))
+        Right foreigns ->
+          do
+            -- compile
+            rmvar <- newEmptyMVar
+            resultsMVars <- forkWithKey (checkModule env foreigns rmvar) statuses
+            putMVar rmvar resultsMVars
+            rrootMVars <- traverse (fork . checkRoot) sroots
+            results <- traverse readMVar resultsMVars
+            writeDetails root details results
+            toArtifacts env foreigns results <$> traverse readMVar rrootMVars
 
 -- GET ROOT NAMES
 
@@ -205,12 +245,12 @@ data Status
   = SCached Details.Local
   | SChanged Details.Local B.ByteString Src.Module DocsNeed
   | SBadImport Import.Problem
-  | SBadSyntax FilePath File.Time B.ByteString Syntax.Error
+  | SBadSyntax FilePath B.ByteString Syntax.Error
   | SForeign Pkg.Name
   | SKernel
 
-crawlDeps :: Env -> MVar StatusDict -> [ModuleName.Raw] -> a -> IO a
-crawlDeps env mvar deps blockedValue =
+crawlDeps :: Env -> MVar StatusDict -> Sources -> [ModuleName.Raw] -> a -> IO a
+crawlDeps env mvar sources deps blockedValue =
   do
     statusDict <- takeMVar mvar
     let depsDict = Map.fromKeys (\_ -> ()) deps
@@ -220,66 +260,67 @@ crawlDeps env mvar deps blockedValue =
     mapM_ readMVar statuses
     return blockedValue
   where
-    crawlNew name () = fork (crawlModule env mvar (DocsNeed False) name)
+    crawlNew name () = fork (crawlModule env mvar sources (DocsNeed False) name)
 
-crawlModule :: Env -> MVar StatusDict -> DocsNeed -> ModuleName.Raw -> IO Status
-crawlModule env@(Env _ root projectType _ srcDirs buildID locals foreigns) mvar docsNeed name =
-  do
-    let fileName = ModuleName.toFilePath name <.> "gren"
-
-    paths <- filterM File.exists (map (`AbsoluteSrcDir.addRelative` fileName) srcDirs)
-
-    case paths of
-      [path] ->
-        case Map.lookup name foreigns of
-          Just (Details.Foreign dep deps) ->
-            return $ SBadImport $ Import.Ambiguous path [] dep deps
+crawlRootModuleHelp :: Env -> MVar StatusDict -> Sources -> DocsNeed -> ModuleName.Raw -> IO Status
+crawlRootModuleHelp env@(Env _ _ _ _ _ locals _) mvar sources docsNeed name =
+  case Map.lookup name sources of
+    Just source ->
+      if Name.isKernel name
+        then return $ SBadImport Import.NotFound
+        else case Map.lookup name locals of
           Nothing ->
-            do
-              newTime <- File.getTime path
-              case Map.lookup name locals of
-                Nothing ->
-                  crawlFile env mvar docsNeed name path newTime buildID
-                Just local@(Details.Local oldPath oldTime deps _ lastChange _) ->
-                  if path /= oldPath || oldTime /= newTime || needsDocs docsNeed
-                    then crawlFile env mvar docsNeed name path newTime lastChange
-                    else crawlDeps env mvar deps (SCached local)
-      p1 : p2 : ps ->
-        return $ SBadImport $ Import.AmbiguousLocal (FP.makeRelative root p1) (FP.makeRelative root p2) (map (FP.makeRelative root) ps)
-      [] ->
-        case Map.lookup name foreigns of
-          Just (Details.Foreign dep deps) ->
-            case deps of
-              [] ->
-                return $ SForeign dep
-              d : ds ->
-                return $ SBadImport $ Import.AmbiguousForeign dep d ds
-          Nothing ->
-            if Name.isKernel name && Parse.isKernel projectType
-              then do
-                exists <- File.exists ("src" </> ModuleName.toFilePath name <.> "js")
-                return $ if exists then SKernel else SBadImport Import.NotFound
-              else return $ SBadImport Import.NotFound
+            crawlFile env mvar sources docsNeed name source
+          Just local@(Details.Local _ deps _) ->
+            crawlDeps env mvar sources deps (SCached local)
+    Nothing ->
+      return $ SBadImport Import.NotFound
 
-crawlFile :: Env -> MVar StatusDict -> DocsNeed -> ModuleName.Raw -> FilePath -> File.Time -> Details.BuildID -> IO Status
-crawlFile env@(Env _ root projectType _ _ buildID _ _) mvar docsNeed expectedName path time lastChange =
-  do
-    source <- File.readUtf8 (root </> path)
+crawlModule :: Env -> MVar StatusDict -> Sources -> DocsNeed -> ModuleName.Raw -> IO Status
+crawlModule env@(Env _ _ projectType _ _ locals foreigns) mvar sources docsNeed name =
+  case Map.lookup name sources of
+    Just source ->
+      case Map.lookup name foreigns of
+        Just (Details.Foreign dep deps) ->
+          return $ SBadImport $ Import.Ambiguous (_source_path source) [] dep deps
+        Nothing ->
+          if Name.isKernel name
+            then
+              if Parse.isKernel projectType
+                then return SKernel
+                else return $ SBadImport Import.NotFound
+            else case Map.lookup name locals of
+              Nothing ->
+                crawlFile env mvar sources docsNeed name source
+              Just local@(Details.Local _ deps _) ->
+                crawlDeps env mvar sources deps (SCached local)
+    Nothing ->
+      case Map.lookup name foreigns of
+        Just (Details.Foreign dep deps) ->
+          case deps of
+            [] ->
+              return $ SForeign dep
+            d : ds ->
+              return $ SBadImport $ Import.AmbiguousForeign dep d ds
+        Nothing ->
+          return $ SBadImport Import.NotFound
 
-    case Parse.fromByteString projectType source of
-      Left err ->
-        return $ SBadSyntax path time source err
-      Right modul@(Src.Module maybeActualName _ _ imports values _ _ _ _ _ _) ->
-        case maybeActualName of
-          Nothing ->
-            return $ SBadSyntax path time source (Syntax.ModuleNameUnspecified expectedName)
-          Just name@(A.At _ actualName) ->
-            if expectedName == actualName
-              then
-                let deps = map (Src.getImportName . snd) imports
-                    local = Details.Local path time deps (any (isMain . snd) values) lastChange buildID
-                 in crawlDeps env mvar deps (SChanged local source modul docsNeed)
-              else return $ SBadSyntax path time source (Syntax.ModuleNameMismatch expectedName name)
+crawlFile :: Env -> MVar StatusDict -> Sources -> DocsNeed -> ModuleName.Raw -> Source -> IO Status
+crawlFile env@(Env _ _ projectType _ _ _ _) mvar sources docsNeed expectedName (Source path source) =
+  case Parse.fromByteString projectType source of
+    Left err ->
+      return $ SBadSyntax path source err
+    Right modul@(Src.Module maybeActualName _ _ imports values _ _ _ _ _ _) ->
+      case maybeActualName of
+        Nothing ->
+          return $ SBadSyntax path source (Syntax.ModuleNameUnspecified expectedName)
+        Just name@(A.At _ actualName) ->
+          if expectedName == actualName
+            then
+              let deps = map (Src.getImportName . snd) imports
+                  local = Details.Local path deps (any (isMain . snd) values)
+               in crawlDeps env mvar sources deps (SChanged local source modul docsNeed)
+            else return $ SBadSyntax path source (Syntax.ModuleNameMismatch expectedName name)
 
 isMain :: A.Located Src.Value -> Bool
 isMain (A.At _ (Src.Value (A.At _ name) _ _ _ _)) =
@@ -293,7 +334,7 @@ type ResultDict =
 data Result
   = RNew !Details.Local !I.Interface !Opt.LocalGraph !(Maybe Docs.Module)
   | RSame !Details.Local !I.Interface !Opt.LocalGraph !(Maybe Docs.Module)
-  | RCached Bool Details.BuildID (MVar CachedInterface)
+  | RCached Bool (MVar CachedInterface)
   | RNotFound Import.Problem
   | RProblem Error.Module
   | RBlocked
@@ -306,12 +347,12 @@ data CachedInterface
   | Corrupted
 
 checkModule :: Env -> Dependencies -> MVar ResultDict -> ModuleName.Raw -> Status -> IO Result
-checkModule env@(Env _ root projectType _ _ _ _ _) foreigns resultsMVar name status =
+checkModule env@(Env _ root projectType _ _ _ _) foreigns resultsMVar name status =
   case status of
-    SCached local@(Details.Local path time deps hasMain lastChange lastCompile) ->
+    SCached local@(Details.Local path deps hasMain) ->
       do
         results <- readMVar resultsMVar
-        depsStatus <- checkDeps root results deps lastCompile
+        depsStatus <- checkDeps root results deps
         case depsStatus of
           DepsChange ifaces ->
             do
@@ -321,11 +362,11 @@ checkModule env@(Env _ root projectType _ _ _ _ _) foreigns resultsMVar name sta
                 Left err ->
                   return $
                     RProblem $
-                      Error.Module name path time source (Error.BadSyntax err)
+                      Error.Module name path source (Error.BadSyntax err)
           DepsSame _ _ ->
             do
               mvar <- newMVar Unneeded
-              return (RCached hasMain lastChange mvar)
+              return (RCached hasMain mvar)
           DepsBlock ->
             return RBlocked
           DepsNotFound problems ->
@@ -333,16 +374,16 @@ checkModule env@(Env _ root projectType _ _ _ _ _) foreigns resultsMVar name sta
               source <- File.readUtf8 path
               return $
                 RProblem $
-                  Error.Module name path time source $
+                  Error.Module name path source $
                     case Parse.fromByteString projectType source of
                       Right (Src.Module _ _ _ imports _ _ _ _ _ _ _) ->
                         Error.BadImports (toImportErrors env results imports problems)
                       Left err ->
                         Error.BadSyntax err
-    SChanged local@(Details.Local path time deps _ _ lastCompile) source modul@(Src.Module _ _ _ imports _ _ _ _ _ _ _) docsNeed ->
+    SChanged local@(Details.Local path deps _) source modul@(Src.Module _ _ _ imports _ _ _ _ _ _ _) docsNeed ->
       do
         results <- readMVar resultsMVar
-        depsStatus <- checkDeps root results deps lastCompile
+        depsStatus <- checkDeps root results deps
         case depsStatus of
           DepsChange ifaces ->
             compile env docsNeed local source ifaces modul
@@ -357,14 +398,14 @@ checkModule env@(Env _ root projectType _ _ _ _ _) foreigns resultsMVar name sta
           DepsNotFound problems ->
             return $
               RProblem $
-                Error.Module name path time source $
+                Error.Module name path source $
                   Error.BadImports (toImportErrors env results imports problems)
     SBadImport importProblem ->
       return (RNotFound importProblem)
-    SBadSyntax path time source err ->
+    SBadSyntax path source err ->
       return $
         RProblem $
-          Error.Module name path time source $
+          Error.Module name path source $
             Error.BadSyntax err
     SForeign home ->
       case foreigns ! ModuleName.Canonical home name of
@@ -381,46 +422,46 @@ data DepsStatus
   | DepsBlock
   | DepsNotFound (NE.List (ModuleName.Raw, Import.Problem))
 
-checkDeps :: FilePath -> ResultDict -> [ModuleName.Raw] -> Details.BuildID -> IO DepsStatus
-checkDeps root results deps lastCompile =
-  checkDepsHelp root results deps [] [] [] [] False 0 lastCompile
+checkDeps :: FilePath -> ResultDict -> [ModuleName.Raw] -> IO DepsStatus
+checkDeps root results deps =
+  checkDepsHelp root results deps [] [] [] [] False
 
 type Dep = (ModuleName.Raw, I.Interface)
 
 type CDep = (ModuleName.Raw, MVar CachedInterface)
 
-checkDepsHelp :: FilePath -> ResultDict -> [ModuleName.Raw] -> [Dep] -> [Dep] -> [CDep] -> [(ModuleName.Raw, Import.Problem)] -> Bool -> Details.BuildID -> Details.BuildID -> IO DepsStatus
-checkDepsHelp root results deps new same cached importProblems isBlocked lastDepChange lastCompile =
+checkDepsHelp :: FilePath -> ResultDict -> [ModuleName.Raw] -> [Dep] -> [Dep] -> [CDep] -> [(ModuleName.Raw, Import.Problem)] -> Bool -> IO DepsStatus
+checkDepsHelp root results deps new same cached importProblems isBlocked =
   case deps of
     dep : otherDeps ->
       do
         result <- readMVar (results ! dep)
         case result of
-          RNew (Details.Local _ _ _ _ lastChange _) iface _ _ ->
-            checkDepsHelp root results otherDeps ((dep, iface) : new) same cached importProblems isBlocked (max lastChange lastDepChange) lastCompile
-          RSame (Details.Local _ _ _ _ lastChange _) iface _ _ ->
-            checkDepsHelp root results otherDeps new ((dep, iface) : same) cached importProblems isBlocked (max lastChange lastDepChange) lastCompile
-          RCached _ lastChange mvar ->
-            checkDepsHelp root results otherDeps new same ((dep, mvar) : cached) importProblems isBlocked (max lastChange lastDepChange) lastCompile
+          RNew _ iface _ _ ->
+            checkDepsHelp root results otherDeps ((dep, iface) : new) same cached importProblems isBlocked
+          RSame _ iface _ _ ->
+            checkDepsHelp root results otherDeps new ((dep, iface) : same) cached importProblems isBlocked
+          RCached _ mvar ->
+            checkDepsHelp root results otherDeps new same ((dep, mvar) : cached) importProblems isBlocked
           RNotFound prob ->
-            checkDepsHelp root results otherDeps new same cached ((dep, prob) : importProblems) True lastDepChange lastCompile
+            checkDepsHelp root results otherDeps new same cached ((dep, prob) : importProblems) True
           RProblem _ ->
-            checkDepsHelp root results otherDeps new same cached importProblems True lastDepChange lastCompile
+            checkDepsHelp root results otherDeps new same cached importProblems True
           RBlocked ->
-            checkDepsHelp root results otherDeps new same cached importProblems True lastDepChange lastCompile
+            checkDepsHelp root results otherDeps new same cached importProblems True
           RForeign iface ->
-            checkDepsHelp root results otherDeps new ((dep, iface) : same) cached importProblems isBlocked lastDepChange lastCompile
+            checkDepsHelp root results otherDeps new ((dep, iface) : same) cached importProblems isBlocked
           RKernel ->
-            checkDepsHelp root results otherDeps new same cached importProblems isBlocked lastDepChange lastCompile
+            checkDepsHelp root results otherDeps new same cached importProblems isBlocked
     [] ->
       case reverse importProblems of
         p : ps ->
           return $ DepsNotFound (NE.List p ps)
         [] ->
           if isBlocked
-            then return $ DepsBlock
+            then return DepsBlock
             else
-              if null new && lastDepChange <= lastCompile
+              if null new
                 then return $ DepsSame same cached
                 else do
                   maybeLoaded <- loadInterfaces root same cached
@@ -431,7 +472,7 @@ checkDepsHelp root results deps new same cached importProblems isBlocked lastDep
 -- TO IMPORT ERROR
 
 toImportErrors :: Env -> ResultDict -> [([Src.Comment], Src.Import)] -> NE.List (ModuleName.Raw, Import.Problem) -> NE.List Import.Error
-toImportErrors (Env _ _ _ _ _ _ locals foreigns) results imports problems =
+toImportErrors (Env _ _ _ _ _ locals foreigns) results imports problems =
   let knownModules =
         Set.unions
           [ Map.keysSet foreigns,
@@ -550,10 +591,10 @@ addToGraph :: ModuleName.Raw -> Status -> [Node] -> [Node]
 addToGraph name status graph =
   let dependencies =
         case status of
-          SCached (Details.Local _ _ deps _ _ _) -> deps
-          SChanged (Details.Local _ _ deps _ _ _) _ _ _ -> deps
+          SCached (Details.Local _ deps _) -> deps
+          SChanged (Details.Local _ deps _) _ _ _ -> deps
           SBadImport _ -> []
-          SBadSyntax _ _ _ _ -> []
+          SBadSyntax _ _ _ -> []
           SForeign _ -> []
           SKernel -> []
    in (name, name, dependencies) : graph
@@ -576,8 +617,6 @@ rootStatusToNamePathPair :: RootStatus -> Maybe (ModuleName.Raw, OneOrMore.OneOr
 rootStatusToNamePathPair sroot =
   case sroot of
     SInside _ -> Nothing
-    SOutsideOk (Details.Local path _ _ _ _ _) _ modul -> Just (Src.getName modul, OneOrMore.one path)
-    SOutsideErr _ -> Nothing
 
 checkOutside :: ModuleName.Raw -> OneOrMore.OneOrMore FilePath -> Either Exit.BuildProjectProblem FilePath
 checkOutside name paths =
@@ -588,17 +627,17 @@ checkOutside name paths =
 checkInside :: ModuleName.Raw -> FilePath -> Status -> Either Exit.BuildProjectProblem ()
 checkInside name p1 status =
   case status of
-    SCached (Details.Local p2 _ _ _ _ _) -> Left (Exit.BP_RootNameDuplicate name p1 p2)
-    SChanged (Details.Local p2 _ _ _ _ _) _ _ _ -> Left (Exit.BP_RootNameDuplicate name p1 p2)
+    SCached (Details.Local p2 _ _) -> Left (Exit.BP_RootNameDuplicate name p1 p2)
+    SChanged (Details.Local p2 _ _) _ _ _ -> Left (Exit.BP_RootNameDuplicate name p1 p2)
     SBadImport _ -> Right ()
-    SBadSyntax _ _ _ _ -> Right ()
+    SBadSyntax _ _ _ -> Right ()
     SForeign _ -> Right ()
     SKernel -> Right ()
 
 -- COMPILE MODULE
 
 compile :: Env -> DocsNeed -> Details.Local -> B.ByteString -> Map.Map ModuleName.Raw I.Interface -> Src.Module -> IO Result
-compile (Env key root projectType platform _ buildID _ _) docsNeed (Details.Local path time deps main lastChange _) source ifaces modul =
+compile (Env key root projectType platform _ _ _) docsNeed (Details.Local path deps main) source ifaces modul =
   let pkg = projectTypeToPkg projectType
    in case Compile.compile platform pkg ifaces modul of
         Right (Compile.Artifacts canonical annotations objects) ->
@@ -606,7 +645,7 @@ compile (Env key root projectType platform _ buildID _ _) docsNeed (Details.Loca
             Left err ->
               return $
                 RProblem $
-                  Error.Module (Src.getName modul) path time source (Error.BadDocs err)
+                  Error.Module (Src.getName modul) path source (Error.BadDocs err)
             Right docs ->
               do
                 let name = Src.getName modul
@@ -619,19 +658,19 @@ compile (Env key root projectType platform _ buildID _ _) docsNeed (Details.Loca
                     do
                       -- iface should be fully forced by equality check
                       Reporting.report key Reporting.BDone
-                      let local = Details.Local path time deps main lastChange buildID
+                      let local = Details.Local path deps main
                       return (RSame local iface objects docs)
                   _ ->
                     do
                       -- iface may be lazy still
                       File.writeBinary greni iface
                       Reporting.report key Reporting.BDone
-                      let local = Details.Local path time deps main buildID buildID
+                      let local = Details.Local path deps main
                       return (RNew local iface objects docs)
         Left err ->
           return $
             RProblem $
-              Error.Module (Src.getName modul) path time source err
+              Error.Module (Src.getName modul) path source err
 
 projectTypeToPkg :: Parse.ProjectType -> Pkg.Name
 projectTypeToPkg projectType =
@@ -651,7 +690,7 @@ addNewLocal name result locals =
   case result of
     RNew local _ _ _ -> Map.insert name local locals
     RSame local _ _ _ -> Map.insert name local locals
-    RCached _ _ _ -> locals
+    RCached _ _ -> locals
     RNotFound _ -> locals
     RProblem _ -> locals
     RBlocked -> locals
@@ -675,7 +714,7 @@ addErrors result errors =
   case result of
     RNew _ _ _ _ -> errors
     RSame _ _ _ _ -> errors
-    RCached _ _ _ -> errors
+    RCached _ _ -> errors
     RNotFound _ -> errors
     RProblem e -> e : errors
     RBlocked -> errors
@@ -687,7 +726,7 @@ addImportProblems results name problems =
   case results ! name of
     RNew _ _ _ _ -> problems
     RSame _ _ _ _ -> problems
-    RCached _ _ _ -> problems
+    RCached _ _ -> problems
     RNotFound p -> (name, p) : problems
     RProblem _ -> problems
     RBlocked -> problems
@@ -701,7 +740,7 @@ data DocsGoal a where
   WriteDocs :: FilePath -> DocsGoal ()
   IgnoreDocs :: DocsGoal ()
 
-newtype DocsNeed = DocsNeed {needsDocs :: Bool}
+newtype DocsNeed = DocsNeed Bool
 
 toDocsNeed :: DocsGoal a -> DocsNeed
 toDocsNeed goal =
@@ -733,7 +772,7 @@ toDocs result =
   case result of
     RNew _ _ _ d -> d
     RSame _ _ _ d -> d
-    RCached _ _ _ -> Nothing
+    RCached _ _ -> Nothing
     RNotFound _ -> Nothing
     RProblem _ -> Nothing
     RBlocked -> Nothing
@@ -753,10 +792,10 @@ data ReplArtifacts = ReplArtifacts
     _repl_annotations :: Map.Map Name.Name Can.Annotation
   }
 
-fromRepl :: FilePath -> Details.Details -> B.ByteString -> IO (Either Exit.Repl ReplArtifacts)
-fromRepl root details source =
+fromRepl :: FilePath -> Details.Details -> Sources -> B.ByteString -> IO (Either Exit.Repl ReplArtifacts)
+fromRepl root details rootSources source =
   do
-    env@(Env _ _ projectType _ _ _ _ _) <- makeEnv Reporting.ignorer root details
+    env@(Env _ _ projectType _ _ _ _) <- makeEnv Reporting.ignorer root details
     case Parse.fromByteString projectType source of
       Left syntaxError ->
         return $ Left $ Exit.ReplBadInput source $ Error.BadSyntax syntaxError
@@ -766,7 +805,7 @@ fromRepl root details source =
 
           let deps = map (Src.getImportName . snd) imports
           mvar <- newMVar Map.empty
-          crawlDeps env mvar deps ()
+          crawlDeps env mvar rootSources deps ()
 
           statuses <- traverse readMVar =<< readMVar mvar
           midpoint <- checkMidpoint dmvar statuses
@@ -781,11 +820,11 @@ fromRepl root details source =
                 putMVar rmvar resultMVars
                 results <- traverse readMVar resultMVars
                 writeDetails root details results
-                depsStatus <- checkDeps root resultMVars deps 0
+                depsStatus <- checkDeps root resultMVars deps
                 finalizeReplArtifacts env source modul depsStatus resultMVars results
 
 finalizeReplArtifacts :: Env -> B.ByteString -> Src.Module -> DepsStatus -> ResultDict -> Map.Map ModuleName.Raw Result -> IO (Either Exit.Repl ReplArtifacts)
-finalizeReplArtifacts env@(Env _ root projectType platform _ _ _ _) source modul@(Src.Module _ _ _ imports _ _ _ _ _ _ _) depsStatus resultMVars results =
+finalizeReplArtifacts env@(Env _ root projectType platform _ _ _) source modul@(Src.Module _ _ _ imports _ _ _ _ _ _ _) depsStatus resultMVars results =
   let pkg =
         projectTypeToPkg projectType
 
@@ -806,10 +845,10 @@ finalizeReplArtifacts env@(Env _ root projectType platform _ _ _ _) source modul
             maybeLoaded <- loadInterfaces root same cached
             case maybeLoaded of
               Just ifaces -> compileInput ifaces
-              Nothing -> return $ Left $ Exit.ReplBadCache
+              Nothing -> return $ Left Exit.ReplBadCache
         DepsBlock ->
           case Map.foldr addErrors [] results of
-            [] -> return $ Left $ Exit.ReplBlocked
+            [] -> return $ Left Exit.ReplBlocked
             e : es -> return $ Left $ Exit.ReplBadLocalDeps root e es
         DepsNotFound problems ->
           return $
@@ -868,7 +907,7 @@ getRootInfo env path =
       else return (Left (Exit.BP_PathUnknown path))
 
 getRootInfoHelp :: Env -> FilePath -> FilePath -> IO (Either Exit.BuildProjectProblem RootInfo)
-getRootInfoHelp (Env _ _ _ _ srcDirs _ _ _) path absolutePath =
+getRootInfoHelp (Env _ _ _ _ srcDirs _ _) path absolutePath =
   let (dirs, file) = FP.splitFileName absolutePath
       (final, ext) = FP.splitExtension file
    in if ext /= ".gren"
@@ -931,82 +970,36 @@ dropPrefix roots paths =
 
 -- CRAWL ROOTS
 
-data RootStatus
+newtype RootStatus
   = SInside ModuleName.Raw
-  | SOutsideOk Details.Local B.ByteString Src.Module
-  | SOutsideErr Error.Module
 
-crawlRoot :: Env -> MVar StatusDict -> RootLocation -> IO RootStatus
-crawlRoot env@(Env _ _ projectType _ _ buildID _ _) mvar root =
+crawlRoot :: Env -> MVar StatusDict -> Sources -> RootLocation -> IO RootStatus
+crawlRoot env mvar sources root =
   case root of
     LInside name ->
-      do
-        statusMVar <- newEmptyMVar
-        statusDict <- takeMVar mvar
-        putMVar mvar (Map.insert name statusMVar statusDict)
-        putMVar statusMVar =<< crawlModule env mvar (DocsNeed False) name
-        return (SInside name)
-    LOutside path ->
-      do
-        time <- File.getTime path
-        source <- File.readUtf8 path
-        case Parse.fromByteString projectType source of
-          Right modul@(Src.Module _ _ _ imports values _ _ _ _ _ _) ->
-            do
-              let deps = map (Src.getImportName . snd) imports
-              let local = Details.Local path time deps (any (isMain . snd) values) buildID buildID
-              crawlDeps env mvar deps (SOutsideOk local source modul)
-          Left syntaxError ->
-            return $
-              SOutsideErr $
-                Error.Module "???" path time source (Error.BadSyntax syntaxError)
+      crawlRootModule env mvar sources name
+    LOutside _ ->
+      error "Bad assumption"
+
+crawlRootModule :: Env -> MVar StatusDict -> Sources -> ModuleName.Raw -> IO RootStatus
+crawlRootModule env mvar sources root =
+  do
+    statusMVar <- newEmptyMVar
+    statusDict <- takeMVar mvar
+    putMVar mvar (Map.insert root statusMVar statusDict)
+    putMVar statusMVar =<< crawlRootModuleHelp env mvar sources (DocsNeed False) root
+    return (SInside root)
 
 -- CHECK ROOTS
 
-data RootResult
+newtype RootResult
   = RInside ModuleName.Raw
-  | ROutsideOk ModuleName.Raw I.Interface Opt.LocalGraph
-  | ROutsideErr Error.Module
-  | ROutsideBlocked
 
-checkRoot :: Env -> ResultDict -> RootStatus -> IO RootResult
-checkRoot env@(Env _ root _ _ _ _ _ _) results rootStatus =
+checkRoot :: RootStatus -> IO RootResult
+checkRoot rootStatus =
   case rootStatus of
     SInside name ->
       return (RInside name)
-    SOutsideErr err ->
-      return (ROutsideErr err)
-    SOutsideOk local@(Details.Local path time deps _ _ lastCompile) source modul@(Src.Module _ _ _ imports _ _ _ _ _ _ _) ->
-      do
-        depsStatus <- checkDeps root results deps lastCompile
-        case depsStatus of
-          DepsChange ifaces ->
-            compileOutside env local source ifaces modul
-          DepsSame same cached ->
-            do
-              maybeLoaded <- loadInterfaces root same cached
-              case maybeLoaded of
-                Nothing -> return ROutsideBlocked
-                Just ifaces -> compileOutside env local source ifaces modul
-          DepsBlock ->
-            return ROutsideBlocked
-          DepsNotFound problems ->
-            return $
-              ROutsideErr $
-                Error.Module (Src.getName modul) path time source $
-                  Error.BadImports (toImportErrors env results imports problems)
-
-compileOutside :: Env -> Details.Local -> B.ByteString -> Map.Map ModuleName.Raw I.Interface -> Src.Module -> IO RootResult
-compileOutside (Env key _ projectType platform _ _ _ _) (Details.Local path time _ _ _ _) source ifaces modul =
-  let pkg = projectTypeToPkg projectType
-      name = Src.getName modul
-   in case Compile.compile platform pkg ifaces modul of
-        Right (Compile.Artifacts canonical annotations objects) ->
-          do
-            Reporting.report key Reporting.BDone
-            return $ ROutsideOk name (I.fromModule pkg canonical annotations) objects
-        Left errors ->
-          return $ ROutsideErr $ Error.Module name path time source errors
 
 -- TO ARTIFACTS
 
@@ -1015,7 +1008,7 @@ data Root
   | Outside ModuleName.Raw I.Interface Opt.LocalGraph
 
 toArtifacts :: Env -> Dependencies -> Map.Map ModuleName.Raw Result -> NE.List RootResult -> Either Exit.BuildProblem Artifacts
-toArtifacts (Env _ root projectType _ _ _ _ _) foreigns results rootResults =
+toArtifacts (Env _ root projectType _ _ _ _) foreigns results rootResults =
   case gatherProblemsOrMains results rootResults of
     Left (NE.List e es) ->
       Left (Exit.BuildBadModules root e es)
@@ -1029,26 +1022,18 @@ gatherProblemsOrMains results (NE.List rootResult rootResults) =
   let addResult result (es, roots) =
         case result of
           RInside n -> (es, Inside n : roots)
-          ROutsideOk n i o -> (es, Outside n i o : roots)
-          ROutsideErr e -> (e : es, roots)
-          ROutsideBlocked -> (es, roots)
 
       errors = Map.foldr addErrors [] results
    in case (rootResult, foldr addResult (errors, []) rootResults) of
         (RInside n, ([], ms)) -> Right (NE.List (Inside n) ms)
         (RInside _, (e : es, _)) -> Left (NE.List e es)
-        (ROutsideOk n i o, ([], ms)) -> Right (NE.List (Outside n i o) ms)
-        (ROutsideOk _ _ _, (e : es, _)) -> Left (NE.List e es)
-        (ROutsideErr e, (es, _)) -> Left (NE.List e es)
-        (ROutsideBlocked, ([], _)) -> error "seems like .gren/ is corrupted"
-        (ROutsideBlocked, (e : es, _)) -> Left (NE.List e es)
 
 addInside :: ModuleName.Raw -> Result -> [Module] -> [Module]
 addInside name result modules =
   case result of
     RNew _ iface objs _ -> Fresh name iface objs : modules
     RSame _ iface objs _ -> Fresh name iface objs : modules
-    RCached main _ mvar -> Cached name main mvar : modules
+    RCached main mvar -> Cached name main mvar : modules
     RNotFound _ -> error (badInside name)
     RProblem _ -> error (badInside name)
     RBlocked -> error (badInside name)
@@ -1063,6 +1048,3 @@ addOutside :: RootResult -> [Module] -> [Module]
 addOutside root modules =
   case root of
     RInside _ -> modules
-    ROutsideOk name iface objs -> Fresh name iface objs : modules
-    ROutsideErr _ -> modules
-    ROutsideBlocked -> modules
